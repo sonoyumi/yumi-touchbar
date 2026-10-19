@@ -1,0 +1,5 @@
+name = "yumi-airpods"
+description = "AirPods: заряд левого, правого и кейса из канала yumi-airpods; касание — меню AirPods (yumi, 19.10.2026)"
+exec = "plugin.py"
+# держать процесс живым после скрытия — иначе до первого кадра видна заглушка с именем
+background = "keep"

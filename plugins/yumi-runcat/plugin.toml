@@ -1,0 +1,5 @@
+name = "yumi-runcat"
+description = "Пиксельный кот бежит быстрее при нагрузке CPU (как RunCat); касание — yumi-sysmon (yumi, 19.10.2026)"
+exec = "plugin.py"
+# держать процесс живым после скрытия — иначе до первого кадра видна заглушка с именем
+background = "keep"

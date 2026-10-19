@@ -1,0 +1,4 @@
+name = "yumi-runcat2"
+description = "Копия yumi-runcat для второго слоя (touchbard различает плагины по имени; plugin.py — ссылка на ../yumi-runcat)"
+exec = "plugin.py"
+background = "keep"

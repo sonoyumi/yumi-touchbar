@@ -1,0 +1,12 @@
+yumi-touchbar — MIT License (LICENSE), © 2026 Vladyslav Shokun.
+
+Third-party parts:
+
+- touchbard — https://github.com/0800tim/touchbard, MIT License, © its author.
+  This repository does not copy touchbard: install.sh clones it at commit 1b29141 and applies
+  patches/0001-daemon-yumi.patch and patches/0002-agent-yumi.patch (changes to touchbard's files, same MIT terms).
+- RunCat365 cat frames — plugins/yumi-runcat/frames/cat_running_0…4.png, https://github.com/Kyome22/RunCat365,
+  © Takuto Nakamura (Kyome22), Apache License 2.0 (plugins/yumi-runcat/frames/LICENSE-RunCat365). Unmodified;
+  the plugin only fills the shape with a colour when drawing.
+- Icons in the style are glyphs of Nerd Fonts (MIT / OFL) and app icons of the installed icon theme;
+  no icon files are included here.

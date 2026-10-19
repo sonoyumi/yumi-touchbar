@@ -1,0 +1,306 @@
+--- a/agent/touchbar-agent
++++ b/agent/touchbar-agent
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env python3
++# yumi-touchbar: агент touchbard с правками yumi — команды кнопок, свайп слоёв, погода, тексты песен, Touch ID (docs/PATCHES.md)
+ """touchbar-agent: the session half of the Omarchy Touch Bar.
+ 
+ touchbard (a system service) owns the Touch Bar hardware. This agent runs in
+@@ -126,13 +127,11 @@
+                    "act": {"cmd": "hyprctl eval 'hl.dispatch(hl.dsp.focus({ workspace = \"{id}\" }))'"}},
+     "clock": {"kind": "clock", "w": 190, "style": "plain", "format": "%a %-d %b  %H:%M"},
+     "battery": {"kind": "battery", "w": 130, "style": "plain"},
+-    "apps": cmd(G["apps"], "omarchy-menu toggle apps"),
+-    "menu": cmd(G["menu"], "omarchy-menu toggle"),
+-    "overview": cmd(G["overview"], "qs ipc -c overview call overview toggle"),
+-    "screenshot": cmd(G["screenshot"], "omarchy capture screenshot"),
+-    "record": cmd(G["record"], "omarchy capture screenrecording"),
+-    "lock": cmd(G["lock"], "omarchy system lock"),
+-    "nightlight": cmd(G["night"], "omarchy toggle nightlight"),
++    # yumi (19.10.2026): команды Omarchy → свои; overview/record/nightlight (Omarchy-only) убраны — у yumi их нет
++    "apps": cmd(G["apps"], "qs -c yumi ipc call launcher apps"),
++    "menu": cmd(G["menu"], "qs -c yumi ipc call control toggle"),
++    "screenshot": cmd(G["screenshot"], "yumi-screenshot s"),
++    "lock": cmd(G["lock"], "yumi-lock"),
+     "emoji": key(["LeftMeta", "LeftCtrl", "E"], icon=G["emoji"], w=84),
+     "flex": {"kind": "flex"},
+     "gap": {"kind": "gap", "w": 14},
+@@ -230,7 +229,10 @@
+     fn_layer = s.get("fn_key_layer", "function")
+     settings = {k: s[k] for k in ("dim_after", "off_after", "max_brightness", "slider_timeout",
+                                   "fingerprint_width", "dim_while_scanning", "visualizers", "nowplaying",
+-                                  "viz_colors")
++                                  "viz_colors",
++                                  # yumi (19.10): свайп между слоями
++                                  "swipe_layers", "swipe_min", "swipe_start", "swipe_anim_ms", "layer_names",
++                                  "fps", "fps_log", "touchid_style", "touchid_seal")   # yumi (19.10): предел кадров/с, счётчик кадров в журнал
+                 if k in s}
+     return {"t": "layout", "layers": layers, "default": default,
+             "fn_layer": fn_layer if fn_layer in layers else None, "settings": settings}
+@@ -281,11 +283,12 @@
+     overrides = cfg.get("theme", {})
+     for role, key_ in (("background", "bg"), ("button", "surface"), ("track", "surface_hi"),
+                        ("foreground", "fg"), ("dim", "fg_dim"), ("accent", "accent"),
+-                       ("red", "red"), ("green", "green"), ("yellow", "yellow"), ("font", "font")):
++                       ("red", "red"), ("green", "green"), ("yellow", "yellow"), ("font", "font"),
++                       ("pill_style", "pill_style")):   # yumi (19.10): "outline" — капсулы рамкой
+         v = overrides.get(role)
+         if isinstance(v, str) and v:
+             # A role can name another theme colour, e.g. accent = "magenta".
+-            theme[key_] = colors.get(v, v) if not v.startswith("#") and key_ != "font" else v
++            theme[key_] = colors.get(v, v) if not v.startswith("#") and key_ not in ("font", "pill_style") else v
+     return theme
+ 
+ 
+@@ -508,6 +511,9 @@
+     return float(ip["latitude"]), float(ip["longitude"]), ip.get("city") or name, ip.get("country_code")
+ 
+ 
++WEATHER_MEM = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "yumi" / "touchbar-weather.json"
++
++
+ def fetch_weather(wcfg, where):
+     """Everything the widget and the expanded view need, as state keys."""
+     import datetime
+@@ -516,10 +522,10 @@
+     api_wind, wind_label, to_kmh = WIND_UNITS[wind_key]
+     d = http_json(
+         "https://api.open-meteo.com/v1/forecast"
+-        f"?latitude={lat:.4f}&longitude={lon:.4f}&timezone=auto&forecast_days=2"
++        f"?latitude={lat:.4f}&longitude={lon:.4f}&timezone=auto&forecast_days=13"
+         "&current=temperature_2m,apparent_temperature,weather_code,is_day,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+         "&hourly=temperature_2m,weather_code,precipitation_probability,is_day"
+-        "&daily=temperature_2m_max,temperature_2m_min"
++        "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
+         f"&temperature_unit={temp_unit}&wind_speed_unit={api_wind}")
+     cur = d["current"]
+ 
+@@ -549,7 +555,18 @@
+         hours.append([label, hicon, h["temperature_2m"][i], h["precipitation_probability"][i] or 0, hkind])
+         if len(hours) == 12:
+             break
++    # yumi (16.10): 12 дней для свайпа в развёрнутой погоде — [подпись, значок, макс, мин, осадки %, вид]
++    days = []
++    dd = d.get("daily", {})
++    wd = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
++    for i, t in enumerate(dd.get("time", [])[:12]):
++        ds = datetime.date.fromisoformat(t)
++        _, dicon, dkind = look(dd["weather_code"][i], 1)
++        label = "Сегодня" if i == 0 else f"{wd[ds.weekday()]} {ds.day}"
++        days.append([label, dicon, dd["temperature_2m_max"][i], dd["temperature_2m_min"][i],
++                     (dd.get("precipitation_probability_max") or [0] * 13)[i] or 0, dkind])
+     state = {
++        "weather_days": days,
+         "weather_icon": icon, "weather_kind": kind, "weather_desc": desc,
+         "weather_temp": cur["temperature_2m"], "weather_feels": cur.get("apparent_temperature"),
+         "weather_hi": d["daily"]["temperature_2m_max"][0], "weather_lo": d["daily"]["temperature_2m_min"][0],
+@@ -686,6 +703,22 @@
+     return t.strip(), a
+ 
+ 
++def fetch_lyrics_yumi(m):
++    """yumi (16.10): тот же текст, что у плеера Quickshell — yumilyrics (YouTube Music → Apple → LRCLIB, свой кэш).
++    Раньше Touch Bar искал только в LRCLIB (и ловил 429) — к части песен текста не было, хотя в плеере он есть.
++    Только с таймингами; сдвиг как у плеера (LYRICS_LEAD 0,2 с — строка чуть раньше). Нет/ошибка — [] (дальше LRCLIB)."""
++    try:
++        sys.path.insert(0, str(Path.home() / ".local/lib/yumi/panel"))
++        import yumilyrics
++        res = yumilyrics.fetch(m.get("title"), m.get("artist"), m.get("length"), m.get("url") or "")
++    except Exception as e:
++        log(f"yumilyrics: {e}")
++        return []
++    if not res or not res.get("synced") or not res.get("lines"):
++        return []
++    return [[max(0.0, round(float(t) - 0.2, 2)), s or ""] for t, s in res["lines"]]
++
++
+ def fetch_lyrics(title, artist, length):
+     """Timed lyric lines for a track: [] if it has none, None if LRCLIB
+     couldn't be reached (try again later). Cached on disk per track."""
+@@ -1067,7 +1100,7 @@
+ 
+         self.reload(force=True)
+         self.connect()
+-        GLib.timeout_add_seconds(2, self.reconnect_tick)
++        GLib.timeout_add(200, self.reconnect_tick)   # yumi: 0,2 с, а не 2 с — меньше старой раскладки touchbard при запуске
+         GLib.timeout_add(1500, self.watch_files)
+         GLib.timeout_add(600, self.poll_sysfs)
+         try:
+@@ -1086,6 +1119,10 @@
+         self.weather_where, self.weather_ok_at, self.weather_retry = None, 0.0, None
+         self.live_prev, self.live_busy = None, False
+         GLib.timeout_add(2000, self.live_tick)
++        try:   # yumi: последняя известная погода сразу, пока свежая не пришла (сеть при загрузке ещё не поднялась)
++            self.push_state(**json.loads(WEATHER_MEM.read_text()))
++        except (OSError, ValueError, TypeError):
++            pass
+         self.weather_tick()
+         GLib.timeout_add_seconds(15 * 60, self.weather_tick)
+ 
+@@ -1243,6 +1280,9 @@
+             self.sync_plugins()
+         elif t == "seek":
+             self.seek(float(msg.get("pos", 0)))
++        elif t == "layer":
++            # yumi (19.10): демон сменил слой свайпом — пока только в журнал
++            log(f"layer (свайп): {msg.get('name')}")
+ 
+     # ---- plugins ----------------------------------------------------------
+ 
+@@ -1283,8 +1323,9 @@
+                 # Background plugins get a grace period, so quick play/pause
+                 # toggles don't restart them over and over.
+                 p.unwanted_since = now
+-                GLib.timeout_add_seconds(11, lambda: (self.sync_plugins(), False)[1])
+-            elif now - p.unwanted_since >= 10:
++                # yumi (19.10): 120 с вместо 10 — при листании слоёв свайпом плагины не перезапускаются
++                GLib.timeout_add_seconds(121, lambda: (self.sync_plugins(), False)[1])
++            elif now - p.unwanted_since >= 120:
+                 self.plugins.pop(pid).stop()
+         for pid, spec in want.items():
+             p = self.plugins.get(pid)
+@@ -1426,6 +1467,8 @@
+ 
+     def start_volume_watch(self):
+         self.read_volume()
++        if not getattr(self, "vol_resync", None):          # yumi 18.10: страховка от потерянных событий
++            self.vol_resync = GLib.timeout_add_seconds(2, self.resync_volume)
+         try:
+             self.pactl = Gio.Subprocess.new(["pactl", "subscribe"], Gio.SubprocessFlags.STDOUT_PIPE)
+         except GLib.Error as e:
+@@ -1448,6 +1491,13 @@
+                 self.vol_timer = GLib.timeout_add(40, self.read_volume)
+         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_pactl_line)
+ 
++    def resync_volume(self):
++        """yumi 18.10: раз в 2 с сверить кнопки звука/микрофона с PipeWire — если событие pactl потерялось,
++        Mute на тачбаре не остаётся в другом состоянии, чем бар."""
++        if self.vol_timer is None:
++            self.read_volume()
++        return True
++
+     def read_volume(self):
+         self.vol_timer = None
+         changes = {}
+@@ -1625,7 +1675,9 @@
+             m = dict(self.media)
+ 
+             def work():
+-                lines = fetch_lyrics(m.get("title"), m.get("artist"), m.get("length"))
++                lines = fetch_lyrics_yumi(m)
++                if not lines:
++                    lines = fetch_lyrics(m.get("title"), m.get("artist"), m.get("length"))
+                 GLib.idle_add(lambda: (self.lyrics_done(key, tries, lines), False)[1])
+             threading.Thread(target=work, daemon=True).start()
+             return False
+@@ -1727,6 +1779,11 @@
+                     self.weather_where = weather_location(wcfg)
+                 state = fetch_weather(wcfg, self.weather_where)
+                 self.weather_ok_at = time.time()
++                try:   # yumi: запомнить — при следующем запуске сразу показать (как виджет экрана блокировки)
++                    WEATHER_MEM.parent.mkdir(parents=True, exist_ok=True)
++                    WEATHER_MEM.write_text(json.dumps(state, ensure_ascii=False))
++                except OSError:
++                    pass
+             except Exception as e:  # offline, rate limited, ...; keep the last reading
+                 log(f"weather: {e}")
+                 stale = time.time() - self.weather_ok_at > 3600
+@@ -1738,7 +1795,7 @@
+                         self.weather_tick()
+                         return False
+                     GLib.idle_add(lambda: (setattr(self, "weather_retry",
+-                                                   self.weather_retry or GLib.timeout_add_seconds(120, retry)), False)[1])
++                                                   self.weather_retry or GLib.timeout_add_seconds(10 if not self.weather_ok_at else 120, retry)), False)[1])  # yumi: пока погоды ещё не было (сеть при загрузке) — каждые 10 с
+             GLib.idle_add(lambda: (self.push_state(**state), False)[1])
+ 
+         threading.Thread(target=work, daemon=True).start()
+@@ -1792,11 +1849,16 @@
+                         workspace=active.get("id", 1), app=win.get("class") or "")
+         # Per-app layers: [apps] "regex" = "layer" in the config.
+         try:
+-            apps = load_config().get("apps", {})
++            cfg = load_config()
++            apps = cfg.get("apps", {})
++            fs_only = bool(cfg.get("settings", {}).get("apps_fullscreen_only", False))
+         except Exception:
+-            apps = {}
++            apps, fs_only = {}, False
+         cls = win.get("class") or ""
+         layer = next((l for pat, l in apps.items() if re.search(pat, cls, re.I)), None)
++        # yumi (16.10): apps_fullscreen_only = true — слой приложения только когда его окно на весь экран
++        if fs_only and not win.get("fullscreen"):
++            layer = None
+         if layer != self.app_layer:
+             self.app_layer = layer
+             default = (self.layout_msg or {}).get("default", "control")
+@@ -1813,10 +1875,49 @@
+             return
+         self.system.signal_subscribe("net.reactivated.Fprint", "net.reactivated.Fprint.Device", None, None,
+                                      None, Gio.DBusSignalFlags.NONE, self.on_finger)
++        # yumi (19.10.2026): окно Touch ID держится, пока fprintd ждёт палец (свойство finger-needed). Раньше демон
++        # снимал окно по Enter — и после неверного пароля на экране блокировки тачбар переставал просить палец,
++        # хотя проверка отпечатка шла дальше
++        self.fp_last = "idle"
++        self.fp_idle_timer = 0
++        self.system.signal_subscribe("net.reactivated.Fprint", "org.freedesktop.DBus.Properties", "PropertiesChanged",
++                                     None, "net.reactivated.Fprint.Device", Gio.DBusSignalFlags.NONE, self.on_finger_props)
++
++    def send_finger(self, s):
++        self.fp_last = s
++        if self.fp_idle_timer:
++            GLib.source_remove(self.fp_idle_timer)
++            self.fp_idle_timer = 0
++        self.send({"t": "fingerprint", "s": s})
++
++    def on_finger_props(self, conn, sender, path, iface, signal, params):
++        _, changed, _ = params.unpack()
++        if "finger-present" in changed:
++            self.fp_present = bool(changed["finger-present"])
++        if "finger-needed" not in changed:
++            return
++        if changed["finger-needed"]:
++            if self.fp_idle_timer:
++                GLib.source_remove(self.fp_idle_timer)
++                self.fp_idle_timer = 0
++            if self.fp_last != "scan":
++                self.send_finger("scan")
++        elif self.fp_last == "scan" and not self.fp_idle_timer:
++            # проверка закончилась без итога (пароль, Ctrl+C, таймаут). 19.10: когда палец ложится на сенсор,
++            # finger-needed тоже падает в false до итога — через 0,4 с окно мигало раскладкой. Теперь ждём 1,5 с
++            # и не снимаем окно, пока палец на сенсоре (finger-present); итог match/fail отменяет таймер
++            def gone():
++                if getattr(self, "fp_present", False) and self.fp_last == "scan":
++                    return True                     # палец ещё лежит — проверить снова через 1,5 с
++                self.fp_idle_timer = 0
++                if self.fp_last == "scan":
++                    self.send_finger("idle")
++                return False
++            self.fp_idle_timer = GLib.timeout_add(1500, gone)
+ 
+     def on_finger(self, conn, sender, path, iface, signal, params):
+         if signal == "VerifyFingerSelected":
+-            self.send({"t": "fingerprint", "s": "scan"})
++            self.send_finger("scan")
+         elif signal == "VerifyStatus":
+             result, done = params.unpack()
+             if result == "verify-match":
+@@ -1826,9 +1927,17 @@
+             elif result in ("verify-retry-scan", "verify-swipe-too-short", "verify-finger-not-centered",
+                             "verify-remove-and-retry"):
+                 s = "retry"
+-            else:  # unknown-error (e.g. locked out after too many wrong fingers), disconnected
++            elif result in ("verify-unknown-error", "verify-disconnected"):
++                # yumi (19.10.2026): так приходит и ПРЕРВАННАЯ проверка — экран блокировки Quickshell снимает ожидание
++                # пальца после входа паролем, драйвер apple-sep отвечает «ошибкой»; и сбой связи с сенсором. Это не
++                # промах пальцем — просто убрать подсказку, без «не распознан»
++                s = "idle"
++            else:  # прочее (напр. блокировка после многих неверных пальцев)
+                 s = "error"
+-            self.send({"t": "fingerprint", "s": s})
++            # retry — проверка продолжается, окно остаётся «ждёт палец»
++            self.send_finger(s)
++            if s == "retry":
++                self.fp_last = "scan"
+ 
+ 
+ def main():

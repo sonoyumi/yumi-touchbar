@@ -1,0 +1,291 @@
+# Стиль тачбара «Конструктор» (yumi, 19.10.2026) — набор из конструктора: 5 слоёв по длинному свайпу, Папка, слои приложений
+# Справка по всем пунктам: share/touchbar/config.toml в исходниках touchbard
+#
+#   свайп (дальше трети полосы):  Главный → Инструменты → Звук и AirPods → Фокус → Окна и сеть
+#   Ctrl+Super+1…5 — эти слои по номеру, 6 — Папка, 7 — F1–F12 (yumi-touchbar-layer)
+#   Слои 2–5 — плагины-ряды yumi-row (значок + подпись), ОЗУ, AirPods, выход звука, буфер, Pomodoro и таймеры.
+
+[settings]
+apps_fullscreen_only = false  # 19.10: слои приложений всегда, когда окно в фокусе (было true — только на весь экран)
+default_layer = "control"
+esc = "hide"                 # на M1 есть физический Esc
+fn_key_layer = "function"    # держишь Fn — F1–F12
+dim_after = 270   # вместе с затемнением экрана (hypridle 270 с)
+off_after = 350   # вместе с отключением экрана (hypridle 350 с)
+max_brightness = 150
+slider_timeout = 3
+nowplaying = "bars"         # за названием — живой эквалайзер (cava)
+viz_colors = "theme"         # эквалайзер и прогресс трека — цвета обоев
+# длинный свайп между слоями (патч touchbard-swipe-layers, 19.10)
+swipe_layers = ["control", "tools", "sound", "focus", "net"]
+swipe_min = 0.196            # доля ширины полосы ≈ 4,5 см (19.10: было 0.33 ≈ 7,6 см, затем 0.25)
+swipe_start = 25             # px (19.10: было 60 — кнопки успевали нажаться раньше, чем начинался свайп)
+swipe_anim_ms = 260
+fps = 30                     # предел кадров/с (19.10: было зашито 30; патч демона Settings.fps)
+touchid_style = "seal"         # окно Touch ID как экран блокировки «Свиток» (19.10); прежнее — "classic"
+touchid_seal = "/usr/local/share/touchbar/hanko.png"   # печать 弓 米 (копия с экрана блокировки; демону закрыт ~ — ProtectHome)
+layer_names = { control = "Главный", tools = "Инструменты", sound = "Звук и AirPods", focus = "Фокус", net = "Окна и сеть", apps = "Папка", function = "F1–F12", "app-telegram" = "Telegram", "app-zen" = "Zen", "app-dolphin" = "Dolphin", "app-code" = "VS Code", "app-obsidian" = "Obsidian", "app-discord" = "Discord", "app-kitty" = "kitty" }
+
+[theme]
+# цвета — из обоев: yumi-touchbar-theme пишет тему при смене обоев (хук yumi-accent 80-touchbar)
+# 19.10 «Капсулы» в мотиве экрана блокировки «Свиток»: засечки, капсулы рамкой 1 px (откат — убрать две строки ниже)
+font = "Noto Serif, JetBrainsMono Nerd Font"   # текст с засечками, значки из Nerd Font
+pill_style = "outline"
+
+[weather]
+location = ""                 # город для погоды (например "Rome"); пусто — по IP
+clock = "24h"
+
+# ── 1. Главный ──────────────────────────────────────────────────────────────────────────────────────
+[layers.control]
+items = [
+  { icon = "󰉋", image = "/usr/local/share/touchbar/hanko.png", toggle_layer = "apps", toggle = "layer:apps", icon_on = "󰝰", style_on = "accent", width = 84 },   # папка приложений
+  { preset = "nowplaying", caption = "音楽", flex = 1 },
+  { preset = "karaoke", icon = "󰦨", caption = "歌詞", width = 84 },
+  { preset = "media", width = 270 },
+  { preset = "weather", caption = "天気", width = 290 },
+  { preset = "brightness", caption = "光", width = 84, icons = ["󰖙"] },
+  { preset = "volume", caption = "音", width = 84 },
+  { preset = "mute", caption = "消音" },
+  { plugin = "yumi-runcat", width = 104 },                                                    # кот бежит быстрее при нагрузке CPU; касание — btop
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+# ── 2. Инструменты ──────────────────────────────────────────────────────────────────────────────────
+[layers.tools]
+items = [
+  { plugin = "yumi-row", width = 380, options = { buttons = [   # снимки (satty)
+      { icon = "󰩭", label = "Область", command = "yumi-screenshot s" },
+      { icon = "󰍹", label = "Экран", command = "yumi-screenshot m" },
+  ] } },
+  { plugin = "yumi-clip", flex = 1, options = { count = 2 } },                                # последние копии; значок — меню буфера
+  { plugin = "yumi-row2", width = 330, options = { buttons = [   # эмодзи (значок), обои
+      { icon = "󰇲", label = "", command = "qs -c yumi ipc call picker emoji", w = 0.6 },
+      { icon = "󰋩", label = "Обои", command = "qs -c yumi ipc call menu center wallpaper" },
+  ] } },
+  { plugin = "yumi-runcat2", width = 150, options = { pct = true } },                           # кот + загрузка CPU %
+  { plugin = "yumi-ram", width = 360 },                                                       # память ОЗУ (19.10: вместо Wi-Fi/VPN/BT/батареи)
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+# ── 3. Звук и AirPods ───────────────────────────────────────────────────────────────────────────────
+[layers.sound]
+items = [
+  { plugin = "yumi-airpods", flex = 1 },                                                      # заряд L / R / кейс; касание — меню AirPods
+  { plugin = "yumi-anc", width = 560 },                                                       # режим AirPods: текущий подсвечен, касание — сменить
+  { plugin = "yumi-output", width = 300 },                                                    # выход звука: касание — следующий
+  "mic",
+  { plugin = "yumi-row2", width = 240, options = { buttons = [   # громкость потока плеера − / + (как ползунок в баре; yumi-player-volume)
+      { icon = "󰝞", label = "Плеер", command = "yumi-player-volume down" },
+      { icon = "󰝝", label = "Плеер", command = "yumi-player-volume up" },
+  ] } },
+  { preset = "volume", caption = "音", width = 84 },
+  { preset = "mute", caption = "消音" },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+# ── 4. Фокус и учёба ────────────────────────────────────────────────────────────────────────────────
+[layers.focus]
+items = [
+  { plugin = "yumi-pomodoro", width = 600 },                                                  # 25/5, касание — старт/пауза, справа — сброс
+  { plugin = "yumi-timer", width = 340 },                                                     # 5/15/25/50 мин — идут в полосе Pomodoro
+  { plugin = "yumi-caffeine", width = 84 },
+  { plugin = "yumi-row", flex = 1, options = { buttons = [   # учёба
+      { icon = "󰠠", label = "Режим", command = "yumi-workflow next" },
+      { icon = "󰑴", label = "Stepik", command = "zen-browser https://stepik.org" },
+      { icon = "󰌠", label = "Python", command = "code ~/Projects/Python" },
+      { icon = "󰚩", label = "ai", command = "uwsm app -- kitty --class yumi-ai -e ai" },   # локальный qwen2.5-coder:3b, офлайн
+  ] } },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+# ── 5. Окна и сеть ──────────────────────────────────────────────────────────────────────────────────
+[layers.net]
+items = [
+  { preset = "workspaces", width = 420 },                                                     # столы 1–6 (миниатюры — плагин позже)
+  { plugin = "yumi-row", flex = 1, options = { buttons = [   # окна и сеть
+      { icon = "󰕰", label = "Обзор", command = "qs -c yumi ipc call menu center workspaces" },
+      { icon = "󰛑", label = "Скрытый", command = "hyprctl eval 'hl.dispatch(hl.dsp.workspace.toggle_special())'" },
+      { icon = "󰓅", label = "Скорость", command = "yumi-launch term speedtest" },
+  ] } },
+  { plugin = "yumi-status", width = 560 },                                                    # Wi-Fi · VPN · Bluetooth · батарея (касание — меню)
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+# ── Папка (открывается кнопкой 󰉋 слева) ───────────────────────────────────────────────────────────
+[layers.apps]
+items = [
+  { icon = "󰝰", toggle_layer = "apps", style = "accent", width = 84 },                           # закрыть папку
+  { plugin = "yumi-dock", flex = 1, options = { px = 40, cell = 96, labels = false, running = true, focus = true, apps = [
+      { label = "Файлы",      icon = "org.kde.dolphin",             command = "dolphin", class = "dolphin" },
+      { label = "Zen",        icon = "zen-browser",                 command = "zen-browser", class = "^zen" },
+      { label = "kitty",      icon = "kitty",                       command = "kitty", class = "^kitty$" },
+      { label = "VS Code",    icon = "vscode",                      command = "code", class = '^(code|code-oss|code-url-handler|com\.microsoft\.vscode)$' },
+      { label = "Telegram",   icon = "org.telegram.desktop",        command = "Telegram", class = "telegram" },
+      { label = "Discord",    icon = "dev.vencord.Vesktop",         command = "flatpak run dev.vencord.Vesktop", class = "vesktop" },
+      { label = "Obsidian",   icon = "md.obsidian.Obsidian",        command = "flatpak run md.obsidian.Obsidian", class = "obsidian" },
+      { label = "Музыка",     icon = "multimedia-audio-player",     command = "qs -c yumi ipc call menu center music", class = "^$" },
+      { label = "OBS",        icon = "com.obsproject.Studio",       command = "obs", class = "^obs$|obsproject" },
+      { label = "Kdenlive",   icon = "org.kde.kdenlive",            command = "flatpak run org.kde.kdenlive", class = "kdenlive" },
+      { label = "LocalSend",  icon = "org.localsend.localsend_app", command = "flatpak run org.localsend.localsend_app", class = "localsend" },
+      { label = "btop",       icon = "btop",                        command = "kitty --class btop -e btop", class = "^btop$" },
+      { label = "LibreOffice",icon = "libreoffice-startcenter",     command = "libreoffice", class = "libreoffice|soffice" },
+      { label = "Все",        icon = "view-app-grid",               command = "qs -c yumi ipc call launcher apps", class = "^$" },
+  ] } },
+  "gap:8",
+  { icon = "󰇲", command = "qs -c yumi ipc call picker emoji", width = 84 },
+  { plugin = "yumi-caffeine", width = 84 },
+  "gap:14",
+  { preset = "volume", caption = "音", width = 84 },
+  { preset = "mute", caption = "消音" },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+[layers.function]
+items = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"]
+
+# ── Слои приложений: окно в фокусе → его слой; 󰕮 слева — Главный слой (до смены окна) ──────────────
+[apps]
+'^(code|code-oss|code-url-handler|com\.microsoft\.vscode)$'    = "app-code"       # VS Code
+"^zen"                                                         = "app-zen"        # Zen
+"dolphin"                                                      = "app-dolphin"    # Dolphin
+"^kitty$"                                                      = "app-kitty"      # kitty
+"obsidian"                                                     = "app-obsidian"   # Obsidian
+"telegram"                                                     = "app-telegram"   # Telegram
+"vesktop|discord"                                              = "app-discord"    # Discord (Vesktop)
+
+[layers.app-telegram]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                               # ВРЕМЕННО: будет плагин yumi-tg (непрочитанные из трея)
+  { icon = "󰍉", keys = ["LeftCtrl", "F"], width = 84 },                                          # поиск
+  { icon = "󰃃", keys = ["LeftCtrl", "Num0"], width = 84 },                                       # Избранное
+  { label = "1", keys = ["LeftCtrl", "Num1"], width = 80 },                                      # закреплённые чаты / папки
+  { label = "2", keys = ["LeftCtrl", "Num2"], width = 80 },
+  { label = "3", keys = ["LeftCtrl", "Num3"], width = 80 },
+  { label = "4", keys = ["LeftCtrl", "Num4"], width = 80 },
+  { label = "5", keys = ["LeftCtrl", "Num5"], width = 80 },
+  { icon = "󰁝", keys = ["LeftAlt", "Up"], width = 85 },                                          # чат выше
+  { icon = "󰁅", keys = ["LeftAlt", "Down"], width = 85 },                                        # чат ниже
+  { label = "Прочитано", keys = ["LeftCtrl", "R"], width = 150 },
+  "gap:14",
+  "flex",                                                                                          # ВРЕМЕННО: yumi-tg-recent (последние чаты)
+  { preset = "volume", caption = "音", width = 84 },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+[layers.app-zen]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                               # ВРЕМЕННО: будет плагин yumi-zen
+  { icon = "󰁍", keys = ["LeftAlt", "Left"], width = 72 },                                        # назад
+  { icon = "󰁔", keys = ["LeftAlt", "Right"], width = 72 },                                       # вперёд
+  { icon = "󰑐", keys = ["F5"], width = 72 },                                                     # обновить
+  "gap:14",
+  { label = "1", keys = ["LeftAlt", "Num1"] },                                                    # ВРЕМЕННО: вкладки 1–8 номерами; будет yumi-zen-tabs с названиями
+  { label = "2", keys = ["LeftAlt", "Num2"] },
+  { label = "3", keys = ["LeftAlt", "Num3"] },
+  { label = "4", keys = ["LeftAlt", "Num4"] },
+  { label = "5", keys = ["LeftAlt", "Num5"] },
+  { label = "6", keys = ["LeftAlt", "Num6"] },
+  { label = "7", keys = ["LeftAlt", "Num7"] },
+  { label = "8", keys = ["LeftAlt", "Num8"] },
+  { icon = "󰝜", keys = ["LeftCtrl", "T"], width = 84 },                                          # новая вкладка
+  { icon = "󰭌", keys = ["LeftCtrl", "W"], width = 84 },                                          # закрыть
+  { icon = "󰦛", keys = ["LeftCtrl", "LeftShift", "T"], width = 84 },                             # вернуть закрытую
+  { icon = "󰅁", keys = ["LeftCtrl", "LeftAlt", "Left"], width = 85 },                            # пространство ←
+  { icon = "󰅂", keys = ["LeftCtrl", "LeftAlt", "Right"], width = 85 },                           # пространство →
+  "gap:14",
+  { preset = "volume", caption = "音", width = 84 },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+[layers.app-dolphin]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                               # ВРЕМЕННО: будет плагин yumi-dolphin (папка, свободно)
+  { icon = "󰁍", keys = ["LeftAlt", "Left"], width = 85 },                                        # назад
+  { icon = "󰁝", keys = ["LeftAlt", "Up"], width = 85 },                                          # вверх
+  "gap:14",
+  { label = "Домой", command = "yumi-dolphin-go ~", flex = 1 },                                   # в этом же окне (Ctrl+L + путь)
+  { label = "Загрузки", command = "yumi-dolphin-go ~/Downloads", flex = 1 },
+  { label = "Документы", command = "yumi-dolphin-go ~/Documents", flex = 1 },
+  { label = "Проекты", command = "yumi-dolphin-go ~/Projects", flex = 1 },
+  { label = "Картинки", command = "yumi-dolphin-go ~/Pictures", flex = 1 },
+  { icon = "󰍉", keys = ["LeftCtrl", "F"], width = 84 },                                          # поиск
+  { label = ".*", keys = ["LeftCtrl", "H"], width = 84 },                                         # скрытые файлы
+  { label = "+ 󰉋", keys = ["F10"], width = 84 },                                                 # новая папка
+  { icon = "󰆍", label = "Терминал", keys = ["LeftShift", "F4"], width = 150 },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+[layers.app-code]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                               # ВРЕМЕННО: будет плагин yumi-code (проект, файл)
+  { icon = "󰘳", keys = ["LeftCtrl", "LeftShift", "P"], width = 84 },                             # палитра команд
+  { icon = "󰆍", keys = ["LeftCtrl", "Grave"], width = 84 },                                      # терминал
+  { icon = "󱎸", keys = ["LeftCtrl", "LeftShift", "F"], width = 84 },                             # поиск по проекту
+  "gap:14",
+  { icon = "󰃤", label = "Запуск", keys = ["F5"], width = 150 },
+  { label = "Стоп", keys = ["LeftShift", "F5"], width = 100 },
+  { label = "Шаг", keys = ["F10"], width = 84 },
+  { label = "Вход", keys = ["F11"], width = 84 },
+  { label = "Выход", keys = ["LeftShift", "F11"], width = 84 },
+  "gap:14",
+  { icon = "󰘬", label = "Git", keys = ["LeftCtrl", "LeftShift", "G"], width = 230 },             # ВРЕМЕННО: будет плагин yumi-git (ветка, изменения)
+  { label = "Ошибки", keys = ["LeftCtrl", "LeftShift", "M"], width = 200 },
+  "flex",
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+[layers.app-obsidian]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                               # ВРЕМЕННО: будет плагин yumi-wintitle (заметка)
+  "flex",
+  { icon = "󰁍", keys = ["LeftCtrl", "LeftAlt", "Left"], width = 85 },                            # назад
+  { icon = "󰁔", keys = ["LeftCtrl", "LeftAlt", "Right"], width = 85 },                           # вперёд
+  { icon = "󱎸", keys = ["LeftCtrl", "LeftShift", "F"], width = 84 },                             # поиск
+  { icon = "󰮗", label = "Перейти", keys = ["LeftCtrl", "O"], width = 150 },
+  { icon = "󰎜", keys = ["LeftCtrl", "N"], width = 84 },                                          # новая заметка
+  { icon = "󱁊", keys = ["LeftCtrl", "G"], width = 84 },                                          # граф
+  { icon = "󰘳", keys = ["LeftCtrl", "P"], width = 84 },                                          # палитра команд
+  "gap:14",
+  { preset = "volume", caption = "音", width = 84 },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+[layers.app-discord]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                               # ВРЕМЕННО: будет плагин yumi-discord (непрочитанное)
+  { icon = "󰍭", keys = ["LeftCtrl", "LeftShift", "M"], width = 85 },                             # микрофон (состояние не видно)
+  { icon = "󰖁", keys = ["LeftCtrl", "LeftShift", "D"], width = 85 },                             # без звука
+  { icon = "󰁝", keys = ["LeftAlt", "LeftShift", "Up"], width = 85 },                             # пред. непрочитанный канал
+  { icon = "󰁅", keys = ["LeftAlt", "LeftShift", "Down"], width = 85 },                           # след. непрочитанный
+  { icon = "󱊷", label = "Прочитано", keys = ["Esc"], width = 150 },
+  { icon = "󰍉", keys = ["LeftCtrl", "K"], width = 84 },                                          # быстрый переход
+  "flex",
+  { preset = "volume", caption = "音", width = 84 },
+  { preset = "mute", caption = "消音" },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]
+
+# ── kitty ───────────────────────────────────────────────────────────────────────────────────────────
+[layers.app-kitty]
+items = [
+  { icon = "󰕮", layer = "control", width = 84, style = "subtle" },                          # главный слой (музыка, папка)
+  "gap:8",
+  { icon = "󰝜", keys = ["LeftCtrl", "LeftShift", "T"] },                                    # новая вкладка  Ctrl+Shift+T
+  { icon = "󰅁", keys = ["LeftCtrl", "LeftShift", "Left"] },                                 # вкладка левее  Ctrl+Shift+←
+  { icon = "󰅂", keys = ["LeftCtrl", "LeftShift", "Right"] },                                # вкладка правее  Ctrl+Shift+→
+  { icon = "󰭌", keys = ["LeftCtrl", "LeftShift", "Q"] },                                    # закрыть вкладку  Ctrl+Shift+Q
+  { icon = "󰯌", keys = ["LeftCtrl", "LeftShift", "Enter"] },                                # новое окно рядом  Ctrl+Shift+Enter
+  { icon = "󰄷", keys = ["LeftCtrl", "LeftShift", "C"] },                                    # копировать  Ctrl+Shift+C
+  { icon = "󰱖", keys = ["LeftCtrl", "LeftShift", "V"] },                                    # вставить  Ctrl+Shift+V
+  { icon = "󰋚", keys = ["LeftCtrl", "LeftShift", "H"] },                                    # прокрутка в пейджере  Ctrl+Shift+H
+  { icon = "󰧳", keys = ["LeftCtrl", "LeftShift", "Minus"] },                                # шрифт меньше  Ctrl+Shift+−
+  { icon = "󰧴", keys = ["LeftCtrl", "LeftShift", "Equal"] },                                # шрифт больше  Ctrl+Shift+=
+  "gap:8",
+  { icon = "󰒮", keys = ["PreviousSong"], width = 84 },
+  { icon = "󰐎", keys = ["PlayPause"], width = 84 },
+  { icon = "󰒭", keys = ["NextSong"], width = 84 },
+  { preset = "volume", caption = "音", width = 84 },
+  { preset = "mute", caption = "消音" },
+  { plugin = "yumi-clock", width = 200, options = { format = "%H:%M · %d.%m", px = 22, font = "Noto Serif CJK JP", command = "qs -c yumi ipc call menu center calendar" } },
+]

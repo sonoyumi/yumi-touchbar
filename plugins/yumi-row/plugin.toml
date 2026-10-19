@@ -1,0 +1,4 @@
+name = "yumi-row"
+description = "Ряд кнопок «значок + подпись» читаемого размера; касание — команда (yumi, 19.10.2026)"
+exec = "plugin.py"
+background = "keep"

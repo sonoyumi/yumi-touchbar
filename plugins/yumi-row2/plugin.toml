@@ -1,0 +1,4 @@
+name = "yumi-row2"
+description = "Копия yumi-row (второй/третий ряд на одном слое; plugin.py — ссылка на ../yumi-row)"
+exec = "plugin.py"
+background = "keep"

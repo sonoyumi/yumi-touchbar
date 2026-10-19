@@ -1,0 +1,15 @@
+// yumi-touchbar (optional): the "ai" button on the Focus layer starts and stops ollama.service without a password.
+// Only ollama.service, only start/stop/restart, only the user named below.
+// Install (puts your login in place of @USER@):
+//   sed "s/@USER@/$USER/" extras/50-yumi-ollama.rules | sudo tee /etc/polkit-1/rules.d/50-yumi-ollama.rules >/dev/null
+// Undo:  sudo rm /etc/polkit-1/rules.d/50-yumi-ollama.rules
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "ollama.service" &&
+        subject.user == "@USER@") {
+        var verb = action.lookup("verb");
+        if (verb == "start" || verb == "stop" || verb == "restart") {
+            return polkit.Result.YES;
+        }
+    }
+});

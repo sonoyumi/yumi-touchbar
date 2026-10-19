@@ -1,0 +1,4 @@
+name = "yumi-anc"
+description = "Режим AirPods: 4 ячейки, текущий подсвечен акцентом; касание — сменить (yumi, 19.10.2026)"
+exec = "plugin.py"
+background = "keep"

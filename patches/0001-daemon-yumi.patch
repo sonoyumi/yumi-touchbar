@@ -1,0 +1,2087 @@
+diff --git a/daemon/src/hw.rs b/daemon/src/hw.rs
+index fb012a1..bf7b550 100644
+--- a/daemon/src/hw.rs
++++ b/daemon/src/hw.rs
+@@ -13,7 +13,7 @@ use std::io::{Seek, SeekFrom, Write};
+ use std::os::fd::{AsFd, BorrowedFd};
+ use std::path::PathBuf;
+ use std::thread::sleep;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ pub struct Card(File);
+ 
+@@ -35,6 +35,12 @@ pub struct Output {
+     /// Panel size as the hardware sees it: narrow and tall (60 x 2008).
+     pub dev_w: u32,
+     pub dev_h: u32,
++    /// yumi (19.10): буфер кадра подключён (mmap) один раз, а не на каждый кадр.
++    map: *mut u32,
++    map_len: usize,
++    /// yumi: накопленное время копирования кадра и dirtyfb (для settings.fps_log).
++    pub stat_copy: Duration,
++    pub stat_dirty: Duration,
+ }
+ 
+ impl Output {
+@@ -91,7 +97,16 @@ impl Output {
+             // kernel reports for a 60 px buffer (240 bytes gives a sheared image).
+             // Allocate 64 px wide and draw into the first 60, as tiny-dfr does.
+             let alloc_w = (w as u32 + 15) & !15;
+-            let db = card.create_dumb_buffer((alloc_w, h as u32), DrmFourcc::Xrgb8888, 32)?;
++            let mut db = card.create_dumb_buffer((alloc_w, h as u32), DrmFourcc::Xrgb8888, 32)?;
++            // yumi: отображение живёт столько же, сколько процесс (forget не даёт сделать munmap)
++            let (map, map_len) = {
++                let mut m = card.map_dumb_buffer(&mut db)?;
++                let s = m.as_mut();
++                assert!(s.as_ptr() as usize % 4 == 0);
++                let r = (s.as_mut_ptr() as *mut u32, s.len() / 4);
++                std::mem::forget(m);
++                r
++            };
+             let fb = card.add_framebuffer(&db, 24, 32)?;
+             card.set_crtc(crtc, Some(fb), (0, 0), &[conn], Some(mode))
+                 .context("set_crtc (is another Touch Bar daemon still running?)")?;
+@@ -101,7 +116,8 @@ impl Output {
+                     path.display(), w, h, db.size(), db.pitch(), db.size().0 * 4, fi.size(), fi.pitch(), fi.bpp()
+                 );
+             }
+-            return Ok(Some(Output { card, db, fb, crtc, conn, mode, dev_w: w as u32, dev_h: h as u32 }));
++            return Ok(Some(Output { card, db, fb, crtc, conn, mode, dev_w: w as u32, dev_h: h as u32,
++                                    map, map_len, stat_copy: Duration::ZERO, stat_dirty: Duration::ZERO }));
+         }
+         Ok(None)
+     }
+@@ -117,11 +133,11 @@ impl Output {
+         let lstride = frame.stride() as usize / 4;
+         let pitch = self.db.pitch() as usize / 4;
+         let (dw, dh) = (self.dev_w as usize, self.dev_h as usize);
++        let t0 = Instant::now();
+         {
+             let src = frame.data().map_err(|e| anyhow!("{e}"))?;
+             let src: &[u32] = bytemuck_cast(&src);
+-            let mut map = self.card.map_dumb_buffer(&mut self.db)?;
+-            let dst: &mut [u32] = bytemuck_cast_mut(map.as_mut());
++            let dst: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(self.map, self.map_len) };
+             for dy in 0..dh.min(lw) {
+                 let row = dy * pitch;
+                 for dx in 0..dw.min(lh) {
+@@ -130,7 +146,11 @@ impl Output {
+                 }
+             }
+         }
+-        match self.card.dirty_framebuffer(self.fb, &[ClipRect::new(0, 0, self.dev_w as u16, self.dev_h as u16)]) {
++        let t1 = Instant::now();
++        self.stat_copy += t1 - t0;
++        let r = self.card.dirty_framebuffer(self.fb, &[ClipRect::new(0, 0, self.dev_w as u16, self.dev_h as u16)]);
++        self.stat_dirty += t1.elapsed();
++        match r {
+             Ok(()) => Ok(()),
+             // Some drivers scan out continuously and don't implement dirty.
+             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Ok(()),
+@@ -151,11 +171,6 @@ fn bytemuck_cast(b: &[u8]) -> &[u32] {
+     unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u32, b.len() / 4) }
+ }
+ 
+-fn bytemuck_cast_mut(b: &mut [u8]) -> &mut [u32] {
+-    assert!(b.as_ptr() as usize % 4 == 0);
+-    unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut u32, b.len() / 4) }
+-}
+-
+ // ---- backlight -------------------------------------------------------------
+ 
+ fn read_u32(p: PathBuf) -> Option<u32> {
+diff --git a/daemon/src/main.rs b/daemon/src/main.rs
+index ff4cf1a..047ec30 100644
+--- a/daemon/src/main.rs
++++ b/daemon/src/main.rs
+@@ -79,6 +79,20 @@ fn decode_art(b64: &str) -> Option<cairo::ImageSurface> {
+     cairo::ImageSurface::create_from_png(&mut std::io::Cursor::new(bytes)).ok()
+ }
+ 
++
++/// 18.10: device name without panicking — input 0.9 `Device::name()` panics on non-UTF-8 names (a Logitech mouse
++/// came up as "Logitech \x08@\xa9\x11" while the receiver was busy and took the whole daemon down on every start).
++fn dev_name(d: &input::Device) -> String {
++    use input::AsRaw;
++    unsafe {
++        let p = input::ffi::libinput_device_get_name(d.as_raw_mut());
++        if p.is_null() {
++            return String::new();
++        }
++        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
++    }
++}
++
+ fn main() {
+     let args: Vec<String> = std::env::args().collect();
+     if args.get(1).map(String::as_str) == Some("--preview") {
+@@ -94,6 +108,15 @@ fn main() {
+     }
+ }
+ 
++/// yumi (16.10): the last layout the agent sent, so the bar starts with it instead of the built-in fallback
++/// (that old layout showed for ~1.5 s at every boot until the agent connected).
++fn load_layout() -> Layout {
++    fs::read_to_string(format!("{STATE_DIR}/layout.json"))
++        .ok()
++        .and_then(|s| serde_json::from_str(&s).ok())
++        .unwrap_or_else(fallback::layout)
++}
++
+ fn load_theme() -> Theme {
+     fs::read_to_string(format!("{STATE_DIR}/theme.json"))
+         .ok()
+@@ -180,14 +203,15 @@ fn run() -> Result<()> {
+     drop_privileges().context("dropping privileges")?;
+ 
+     let (w, h) = out.size();
+-    let mut model = Model::new(w as f64, h as f64, load_theme(), fallback::layout());
++    let mut model = Model::new(w as f64, h as f64, load_theme(), load_layout());
+     let mut frame = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32)?;
+     let mut clients: Vec<Client> = vec![];
+     let mut dirty = true;
+-    // Frames are capped at ~30 fps: spectrum messages and animation ticks
++    // Frames are capped (settings.fps, default 30): spectrum messages and animation ticks
+     // arrive independently and would otherwise each trigger a redraw.
+-    const FRAME: Duration = Duration::from_millis(33);
+-    let mut last_frame = Instant::now() - FRAME;
++    let mut last_frame = Instant::now() - Duration::from_millis(100);
++    // yumi (19.10): счётчик кадров для settings.fps_log — кадры, рисование и вывод за окно
++    let (mut stat_at, mut stat_n, mut stat_draw, mut stat_present) = (Instant::now(), 0u32, Duration::ZERO, Duration::ZERO);
+     // What we last told the agent: the plugin surfaces on screen, and whether the bar is lit.
+     let mut last_specs: Option<Vec<SurfaceSpec>> = None;
+     let mut was_off: Option<bool> = None;
+@@ -243,7 +267,7 @@ fn run() -> Result<()> {
+         }
+ 
+         let frame_wanted = dirty || model.animating(now);
+-        let frame_due = last_frame + FRAME;
++        let frame_due = last_frame + model.frame_interval();
+         if frame_wanted && now >= frame_due {
+             last_frame = now;
+             {
+@@ -251,15 +275,31 @@ fn run() -> Result<()> {
+                 render::draw(&model, &c, now);
+             }
+             frame.flush();
++            let drawn = Instant::now();
+             if let Err(e) = out.present(&mut frame) {
+                 eprintln!("present: {e:#}");
+             }
++            stat_n += 1;
++            stat_draw += drawn - now;
++            stat_present += drawn.elapsed();
+             for r in clients.iter().filter_map(|c| c.rec.as_ref()) {
+                 r.write(&frame, &touches);
+             }
+             dirty = false;
+         }
+ 
++        if stat_at.elapsed() >= Duration::from_secs(5) {
++            if model.layout.settings.fps_log && stat_n > 0 {
++                let secs = stat_at.elapsed().as_secs_f64();
++                let ms = |d: Duration| d.as_secs_f64() * 1000.0 / stat_n as f64;
++                eprintln!("fps: {:.1} ({stat_n} кадров за {secs:.1} с; предел {}), рисование {:.2} мс, вывод {:.2} мс на кадр (копия {:.2}, dirtyfb {:.2})",
++                          stat_n as f64 / secs, model.layout.settings.fps, ms(stat_draw), ms(stat_present),
++                          ms(out.stat_copy), ms(out.stat_dirty));
++            }
++            (out.stat_copy, out.stat_dirty) = (Duration::ZERO, Duration::ZERO);
++            (stat_at, stat_n, stat_draw, stat_present) = (Instant::now(), 0, Duration::ZERO, Duration::ZERO);
++        }
++
+         // Sleep until something happens or something is due.
+         let mut deadline = model.next_deadline(now).unwrap_or(now + Duration::from_secs(5));
+         if dirty {
+@@ -290,6 +330,10 @@ fn run() -> Result<()> {
+         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
+ 
+         let mut effects: Vec<Effect> = vec![];
++        // yumi (19.10): отложенные нажатия кнопок-клавиш, которым пора
++        let keys = model.due_keys(Instant::now());
++        dirty |= !keys.is_empty();
++        effects.extend(keys);
+ 
+         // ---- input ----
+         tb_input.dispatch()?;
+@@ -300,11 +344,11 @@ fn run() -> Result<()> {
+                 Event::Device(DeviceEvent::Added(d)) => {
+                     let dev = d.device();
+                     if debug {
+-                        eprintln!("device added: '{}'", dev.name());
++                        eprintln!("device added: '{}'", dev_name(&dev));
+                     }
+                     // Match on capability, not name: our own virtual keyboard is
+                     // called "Touch Bar ..." too, and would otherwise win.
+-                    if dev.has_capability(input::DeviceCapability::Touch) && dev.name().contains("Touch Bar") {
++                    if dev.has_capability(input::DeviceCapability::Touch) && dev_name(&dev).contains("Touch Bar") {
+                         digitizer = Some(dev);
+                         // It reappears after resume; put our picture back too.
+                         let _ = out.restore();
+@@ -329,7 +373,10 @@ fn run() -> Result<()> {
+                     // the Enter that launched `sudo` is still being released just
+                     // as the prompt appears, and must not clear it.
+                     let is_enter = k.key() == Key::Enter as u32 || k.key() == Key::KpEnter as u32;
+-                    if is_enter
++                    // yumi (19.10): выключено — окно снимает агент, когда fprintd перестаёт ждать палец
++                    // (finger-needed); иначе после неверного пароля на экране блокировки окно пропадало
++                    if false
++                        && is_enter
+                         && k.key_state() == KeyState::Pressed
+                         && model.finger.state == FingerState::Scan
+                         && now - model.finger.since > Duration::from_millis(1000)
+@@ -343,7 +390,7 @@ fn run() -> Result<()> {
+                     }
+                     continue;
+                 }
+-                _ if debug && event.device().name().contains("Touch Bar") && !matches!(event, Event::Touch(_) | Event::Device(_)) => {
++                _ if debug && dev_name(&event.device()).contains("Touch Bar") && !matches!(event, Event::Touch(_) | Event::Device(_)) => {
+                     eprintln!("non-touch event from Touch Bar: {event:?}");
+                 }
+                 Event::Touch(te) => {
+@@ -356,8 +403,8 @@ fn run() -> Result<()> {
+                         if !pos.is_empty() {
+                             eprintln!(
+                                 "touch {pos} from '{}' (digitiser {:?}, backlight off {})",
+-                                te.device().name(),
+-                                digitizer.as_ref().map(|d| d.name().to_string()),
++                                dev_name(&te.device()),
++                                digitizer.as_ref().map(|d| dev_name(d)),
+                                 backlight.is_off()
+                             );
+                         }
+@@ -400,7 +447,7 @@ fn run() -> Result<()> {
+                 }
+                 _ => {
+                     // Pointer and gesture events on the main seat count as activity.
+-                    if event.device().name() != "" {
++                    if dev_name(&event.device()) != "" {
+                         last_activity = now;
+                     }
+                 }
+@@ -480,6 +527,9 @@ fn run() -> Result<()> {
+                                 model.theme = t;
+                             }
+                             Incoming::Layout(l) => {
++                                if let Ok(s) = serde_json::to_string(&l) {
++                                    let _ = fs::write(format!("{STATE_DIR}/layout.json"), s);
++                                }
+                                 clients[i].is_agent = true;
+                                 last_specs = None;
+                                 was_off = None;
+@@ -487,7 +537,8 @@ fn run() -> Result<()> {
+                             }
+                             Incoming::State { values } => model.update_state(values),
+                             Incoming::Fingerprint { s } => model.set_finger(s),
+-                            Incoming::Layer { name } => effects.extend(model.switch_layer(&name)),
++                            // yumi (19.10): слой приложения встаёт в позицию 0 кольца свайпа
++                            Incoming::Layer { name } => effects.extend(model.agent_layer(&name)),
+                             Incoming::Bars { v } => model.set_bars(v),
+                             Incoming::Art { png } => model.art = decode_art(&png),
+                             Incoming::Pixels { id, w, h, len } => clients[i].pending = Some((id, w, h, len)),
+@@ -515,7 +566,7 @@ fn run() -> Result<()> {
+             }
+         }
+         if agent_gone && !clients.iter().any(|c| c.is_agent) {
+-            effects.extend(model.set_layout(fallback::layout()));
++            effects.extend(model.set_layout(load_layout()));
+             model.set_finger(FingerState::Idle);
+             dirty = true;
+         }
+@@ -558,7 +609,27 @@ fn preview(args: &[String]) -> Result<()> {
+         let (k, v) = o.split_once('=').unwrap_or((&o, ""));
+         match k {
+             "layer" => {
+-                model.switch_layer(v);
++                model.agent_layer(v);
++            }
++            // yumi (19.10): кадр свайпа — swipe=-0.4 (доля ширины, минус = влево, к следующему слою)
++            "swipe" => model.swipe = Some(v.parse::<f64>()? * model.w),
++            // yumi: кадр анимации переключения на следующий слой — anim=0.5 (доля пути)
++            "anim" => {
++                let t: f64 = v.parse()?;
++                let dur = Duration::from_millis(model.layout.settings.swipe_anim_ms.max(1));
++                if let Some(next) = model.swipe_neighbor(1) {
++                    let from = -model.layout.settings.swipe_min * model.w * ui::SWIPE_FOLLOW;
++                    model.swipe_anim = Some(ui::SwipeAnim {
++                        base: model.layer.clone(),
++                        other: next.clone(),
++                        from,
++                        to: -(model.w + ui::SWIPE_GAP),
++                        start: Instant::now() - dur.mul_f64(t.clamp(0.0, 1.0)),
++                        dur,
++                    });
++                    model.layer = next;
++                    model.badge_until = Some(Instant::now() + Duration::from_secs(1));
++                }
+             }
+             "finger" => model.set_finger(serde_json::from_value(serde_json::Value::from(v))?),
+             "age" => age = v.parse()?,
+@@ -592,7 +663,17 @@ fn preview(args: &[String]) -> Result<()> {
+             "tapweather" => {
+                 model.weather = Some(Instant::now());
+             }
++            "weatherdays" => {
++                model.weather = Some(Instant::now());
++                model.weather_days = true;
++            }
+             "art" => model.art = Some(cairo::ImageSurface::create_from_png(&mut File::open(v)?)?),
++            // A plugin's frame for design previews: plugin=yumi-clock:/tmp/clock.png (age=2 makes it stale).
++            "plugin" => {
++                let (id, png) = v.split_once(':').context("plugin=ID:file.png")?;
++                let surf = cairo::ImageSurface::create_from_png(&mut File::open(png)?)?;
++                model.surfaces.insert(id.to_string(), (surf, Instant::now()));
++            }
+             "bars" => {
+                 // A made-up spectrum: bass-heavy with some sparkle.
+                 let n: usize = v.parse()?;
+diff --git a/daemon/src/proto.rs b/daemon/src/proto.rs
+index 93f35bc..dd83247 100644
+--- a/daemon/src/proto.rs
++++ b/daemon/src/proto.rs
+@@ -22,6 +22,8 @@ pub struct Theme {
+     /// Second colour for gradients (the theme's magenta).
+     pub accent2: String,
+     pub font: String,
++    /// yumi (19.10): "outline" — капсулы прозрачные с рамкой 1 px (как поле пароля экрана блокировки), текст средним начертанием.
++    pub pill_style: String,
+ }
+ 
+ impl Default for Theme {
+@@ -39,6 +41,7 @@ impl Default for Theme {
+             yellow: "#e0af68".into(),
+             accent2: "#bb9af7".into(),
+             font: "JetBrainsMono Nerd Font".into(),
++            pill_style: String::new(),
+         }
+     }
+ }
+@@ -98,6 +101,10 @@ pub struct Item {
+     pub kind: Kind,
+     pub icon: Option<String>,
+     pub label: Option<String>,
++    /// yumi (19.10): подпись-знак (天気, 光…) столбиком под маленьким значком; без label — вместо большого значка.
++    pub caption: Option<String>,
++    /// yumi: PNG вместо значка (абсолютный путь, доступный службе), например печать 弓 米.
++    pub image: Option<String>,
+     /// Fixed width in pixels. Items without it share the leftover space.
+     pub w: Option<f64>,
+     pub flex: Option<f64>,
+@@ -141,6 +148,24 @@ pub struct Settings {
+     pub nowplaying: String,
+     /// Visualiser colours: "music" (from the track's artwork), "rainbow" or "theme".
+     pub viz_colors: String,
++    /// yumi (19.10): кольцо слоёв для длинного свайпа (2–5 штук); пустое — свайп выключен.
++    pub swipe_layers: Vec<String>,
++    /// yumi: какая доля ширины полосы считается длинным свайпом (переключает слой).
++    pub swipe_min: f64,
++    /// yumi: с какого сдвига пальца по X (px) касание считается свайпом, а не тапом.
++    pub swipe_start: f64,
++    /// yumi: длительность анимации сдвига слоя, мс.
++    pub swipe_anim_ms: u64,
++    /// yumi: подписи слоёв для индикатора («control» → «Главный»); без подписи — ключ слоя.
++    pub layer_names: HashMap<String, String>,
++    /// yumi (19.10): предел частоты кадров (10–120); кадры рисуются только при изменениях.
++    pub fps: u32,
++    /// yumi: раз в 5 с писать в журнал число кадров и время рисования/вывода.
++    pub fps_log: bool,
++    /// yumi (19.10): вид окна Touch ID — "classic" (панель справа) или "seal" (вся полоса, как экран блокировки «Свиток»).
++    pub touchid_style: String,
++    /// yumi: PNG печати для "seal" (абсолютный путь; пусто — без печати).
++    pub touchid_seal: String,
+ }
+ 
+ impl Default for Settings {
+@@ -155,6 +180,15 @@ impl Default for Settings {
+             visualizers: vec!["bars".into()],
+             nowplaying: "bars".into(),
+             viz_colors: "music".into(),
++            swipe_layers: vec![],
++            swipe_min: 0.33,
++            swipe_start: 60.0,
++            swipe_anim_ms: 260,
++            layer_names: HashMap::new(),
++            fps: 30,
++            fps_log: false,
++            touchid_style: "classic".into(),
++            touchid_seal: String::new(),
+         }
+     }
+ }
+@@ -229,6 +263,8 @@ pub enum Outgoing {
+     Seek { pos: f64 },
+     /// The bar went dark or came back; the agent pauses cava meanwhile.
+     Power { on: bool },
++    /// yumi (19.10): слой сменили свайпом — агенту, чтобы toggle_layer-кнопки не путались.
++    Layer { name: String },
+ }
+ 
+ #[derive(Serialize, Debug, Clone, PartialEq)]
+diff --git a/daemon/src/render.rs b/daemon/src/render.rs
+index 4530694..89b5036 100644
+--- a/daemon/src/render.rs
++++ b/daemon/src/render.rs
+@@ -13,6 +13,8 @@ const MARGIN_Y: f64 = 2.0;
+ const RADIUS: f64 = 9.0;
+ const ICON_PX: f64 = 50.0;
+ const LABEL_PX: f64 = 32.0;
++/// yumi (19.10): шрифт подписей-знаков (как 天気 / 音楽 на экране блокировки «Свиток»).
++const CAPTION_FONT: &str = "Noto Serif CJK JP";
+ 
+ #[derive(Clone, Copy)]
+ pub struct Rgb(pub f64, pub f64, pub f64);
+@@ -98,6 +100,12 @@ pub struct Painter<'a> {
+     pub c: &'a Context,
+     pub font: String,
+     pub h: f64,
++    /// yumi (19.10): капсулы рамкой (theme.pill_style = "outline"); fg/surface — для рамки и подсветки.
++    pub outline: bool,
++    pub fg: Rgb,
++    pub surface: Rgb,
++    /// Set when a plugin surface on this frame had nothing to show yet.
++    pub waited: std::cell::Cell<bool>,
+ }
+ 
+ impl Painter<'_> {
+@@ -106,7 +114,8 @@ impl Painter<'_> {
+         let mut fd = pango::FontDescription::from_string(&self.font);
+         fd.set_absolute_size(px * pango::SCALE as f64);
+         if bold {
+-            fd.set_weight(pango::Weight::Bold);
++            // в «капсулах» жирный слишком тяжёл для засечек — среднее начертание, как на экране блокировки
++            fd.set_weight(if self.outline { pango::Weight::Medium } else { pango::Weight::Bold });
+         }
+         l.set_font_description(Some(&fd));
+         l.set_text(text);
+@@ -150,7 +159,48 @@ impl Painter<'_> {
+         }
+     }
+ 
++    /// yumi: подпись-знак столбиком — сверху маленький значок (чтобы привыкнуть к знакам), под ним знак.
++    fn caption_w(&self, icon: Option<&str>, cap: &str, big: bool) -> f64 {
++        let (ip, kp) = if big { (17.0, 21.0) } else { (15.0, 16.0) };
++        let iw = icon.map_or(0.0, |i| self.text_width(i, ip, false));
++        let l = pangocairo::functions::create_layout(self.c);
++        let mut fd = pango::FontDescription::new();
++        fd.set_family(CAPTION_FONT);
++        fd.set_weight(pango::Weight::Medium);
++        fd.set_absolute_size(kp * pango::SCALE as f64);
++        l.set_font_description(Some(&fd));
++        l.set_text(cap);
++        iw.max(l.pixel_size().0 as f64)
++    }
++
++    fn caption(&self, icon: Option<&str>, cap: &str, cx: f64, ink: Rgb, big: bool) {
++        let (ip, kp, dy) = if big { (17.0, 21.0, 12.0) } else { (15.0, 16.0, 10.5) };
++        let cy = self.h / 2.0;
++        if let Some(i) = icon {
++            ink.set_a(self.c, 0.6);
++            self.text(i, ip, false, cx, cy - dy, None);
++        }
++        ink.set_a(self.c, if big { 0.9 } else { 0.6 });
++        seal_text(self.c, cap, CAPTION_FONT, pango::Weight::Medium, kp, cx, cy + dy * 0.85, true);
++    }
++
+     fn pill(&self, x: f64, w: f64, fill: Rgb) {
++        if self.outline {
++            // прозрачная капсула с рамкой 1 px; выделенная или нажатая — полупрозрачная заливка своим цветом
++            let c = self.c;
++            let d = (fill.0 - self.surface.0).abs() + (fill.1 - self.surface.1).abs() + (fill.2 - self.surface.2).abs();
++            rounded(c, x + 0.5, MARGIN_Y + 0.5, w - 1.0, self.h - 2.0 * MARGIN_Y - 1.0, RADIUS);
++            if d > 0.02 {
++                fill.set_a(c, 0.55);
++            } else {
++                self.fg.set_a(c, 0.035);
++            }
++            c.fill_preserve().unwrap();
++            self.fg.set_a(c, 0.16);
++            c.set_line_width(1.0);
++            c.stroke().unwrap();
++            return;
++        }
+         fill.set(self.c);
+         rounded(self.c, x, MARGIN_Y, w, self.h - 2.0 * MARGIN_Y, RADIUS);
+         self.c.fill().unwrap();
+@@ -158,6 +208,10 @@ impl Painter<'_> {
+ }
+ 
+ fn press_level(m: &Model, hit: Hit, now: Instant) -> f64 {
++    // yumi (19.10): слой в движении (свайп) рисуется без подсветки нажатий
++    if m.ghost.get() {
++        return 0.0;
++    }
+     match m.pressed.get(&hit) {
+         Some((true, _)) => 1.0,
+         Some((false, t)) => 1.0 - ((now - *t).as_secs_f64() / PRESS_FADE.as_secs_f64()).min(1.0),
+@@ -189,7 +243,15 @@ fn battery() -> Option<(f64, bool)> {
+ 
+ pub fn draw(m: &Model, c: &Context, now: Instant) {
+     let pal = Palette::from(&m.theme);
+-    let p = Painter { c, font: m.theme.font.clone(), h: m.h };
++    let p = Painter {
++        c,
++        font: m.theme.font.clone(),
++        h: m.h,
++        waited: std::cell::Cell::new(false),
++        outline: m.theme.pill_style == "outline",
++        fg: pal.fg,
++        surface: pal.surface,
++    };
+     pal.bg.set(c);
+     c.paint().unwrap();
+ 
+@@ -199,20 +261,102 @@ pub fn draw(m: &Model, c: &Context, now: Instant) {
+         draw_viz(m, &p, &pal, v, now);
+     } else if let Some(s) = &m.slider {
+         draw_slider(m, &p, &pal, s, now);
++    } else if let Some((base, off, other)) = m.swipe_view(now) {
++        draw_swipe(m, &p, &pal, &base, off, other.as_deref(), now);
++        draw_layer_badge(m, &p, &pal, now);
+     } else {
+         let items = m.items();
+         for (n, (x, w)) in m.item_rects().into_iter().enumerate() {
+             draw_item(m, &p, &pal, &items[n], n, x, w, now);
+         }
++        draw_layer_badge(m, &p, &pal, now);
+     }
+ 
+     let a = m.finger_alpha(now);
+     if a > 0.0 {
+-        draw_finger(m, &p, &pal, a, now);
++        if m.layout.settings.touchid_style == "seal" {
++            draw_finger_seal(m, &p, &pal, a, now);
++        } else {
++            draw_finger(m, &p, &pal, a, now);
++        }
+     }
+     if let Some((msg, at)) = &m.toast {
+         draw_toast(&p, &pal, m, msg, (now - *at).as_secs_f64());
+     }
++    // Remember since when a surface has been waiting for its first frame (drives the breathing).
++    if !p.waited.get() {
++        m.waiting.set(None);
++    } else if m.waiting.get().is_none() {
++        m.waiting.set(Some(now));
++    }
++}
++
++/// yumi (19.10): свайп между слоями — слой едет за пальцем (или доезжает анимацией),
++/// соседний въезжает с края; у края подсказка с его именем, акцентная после swipe_min.
++#[allow(clippy::too_many_arguments)]
++fn draw_swipe(m: &Model, p: &Painter, pal: &Palette, base: &str, off: f64, other: Option<&str>, now: Instant) {
++    let c = p.c;
++    let span = m.w + SWIPE_GAP;
++    let mut layers = vec![(base, off)];
++    if let Some(o) = other {
++        layers.push((o, if off < 0.0 { off + span } else { off - span }));
++    }
++    m.ghost.set(true);
++    for (name, dx) in layers {
++        if dx.abs() >= span {
++            continue;
++        }
++        let items = m.layout.layers.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
++        c.save().unwrap();
++        c.rectangle(0.0, 0.0, m.w, m.h);
++        c.clip();
++        c.translate(dx.round(), 0.0);
++        for (n, (x, w)) in m.rects_for(items).into_iter().enumerate() {
++            draw_item(m, p, pal, &items[n], n, x, w, now);
++        }
++        c.restore().unwrap();
++    }
++    m.ghost.set(false);
++
++    // Подсказка — только пока палец на полосе.
++    let (Some(dx), Some(o)) = (m.swipe, other) else { return };
++    let title = m.layer_title(o);
++    let passed = m.swipe_passed(dx);
++    let px = 20.0;
++    let pw = p.text_width(&title, px, true) + 32.0;
++    let ph = m.h - 2.0 * MARGIN_Y - 8.0;
++    // По центру открывшейся у края полосы, но целиком на экране.
++    let open = off.abs().min(m.w);
++    let cx = if off < 0.0 { m.w - open / 2.0 } else { open / 2.0 };
++    let cx = cx.clamp(pw / 2.0 + 4.0, m.w - pw / 2.0 - 4.0);
++    let (fill, ink) = if passed { (pal.accent, pal.bg) } else { (pal.surface_hi, pal.fg_dim) };
++    fill.set(c);
++    rounded(c, cx - pw / 2.0, (m.h - ph) / 2.0, pw, ph, ph / 2.0);
++    c.fill().unwrap();
++    ink.set(c);
++    let arrow = if off < 0.0 { "\u{2039} " } else { "" };
++    let arrow_r = if off < 0.0 { "" } else { " \u{203A}" };
++    p.text(&format!("{arrow}{title}{arrow_r}"), px, true, cx, m.h / 2.0, None);
++}
++
++/// yumi (19.10): плашка «Имя ● ○ ○» посередине сверху — во время свайпа и ~0,8 с после.
++fn draw_layer_badge(m: &Model, p: &Painter, pal: &Palette, now: Instant) {
++    let Some((title, i, n)) = m.layer_badge(now) else { return };
++    let c = p.c;
++    let dots: String = (0..n).map(|k| if k == i { "\u{25CF}" } else { "\u{25CB}" }).collect::<Vec<_>>().join(" ");
++    let text = format!("{title}  {dots}");
++    let px = 12.0;
++    let (h, y) = (17.0, 1.0);
++    let w = p.text_width(&text, px, true) + 18.0;
++    let x = (m.w - w) / 2.0;
++    pal.bg.set_a(c, 0.92);
++    rounded(c, x, y, w, h, h / 2.0);
++    c.fill_preserve().unwrap();
++    pal.accent.set_a(c, 0.6);
++    c.set_line_width(1.0);
++    c.stroke().unwrap();
++    pal.fg.set(c);
++    p.text(&text, px, true, m.w / 2.0, y + h / 2.0, None);
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -236,7 +380,27 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+             }
+             let icon = if on { it.icon_on.as_deref().or(it.icon.as_deref()) } else { it.icon.as_deref() };
+             let label = if on { it.label_on.as_deref().or(it.label.as_deref()) } else { it.label.as_deref() };
+-            p.content(icon, label, x, w, ink);
++            if let Some(img) = it.image.as_deref().and_then(png) {
++                let side = m.h - 18.0;
++                let (iw, ih) = (img.width() as f64, img.height() as f64);
++                c.save().unwrap();
++                c.translate(x + w / 2.0, m.h / 2.0);
++                c.scale(side / iw, side / ih);
++                c.set_source_surface(&img, -iw / 2.0, -ih / 2.0).unwrap();
++                c.paint_with_alpha(if on { 1.0 } else { 0.9 }).unwrap();
++                c.restore().unwrap();
++            } else if let Some(cap) = it.caption.as_deref() {
++                match label {
++                    None => p.caption(icon, cap, x + w / 2.0, ink, true),
++                    Some(l) => {
++                        let cw = p.caption_w(icon, cap, false);
++                        p.caption(icon, cap, x + 16.0 + cw / 2.0, ink, false);
++                        p.content(None, Some(l), x + cw + 16.0, w - cw - 16.0, ink);
++                    }
++                }
++            } else {
++                p.content(icon, label, x, w, ink);
++            }
+         }
+         Kind::Slider => {
+             let key = it.target.as_deref().unwrap_or("");
+@@ -248,7 +412,11 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+             // Lift the icon clear of the level line along the bottom.
+             c.save().unwrap();
+             c.translate(0.0, -4.0);
+-            p.content(icon, None, x, w, if muted { pal.fg_dim } else { ink });
++            if let Some(cap) = it.caption.as_deref() {
++                p.caption(icon, cap, x + w / 2.0, if muted { pal.fg_dim } else { ink }, true);
++            } else {
++                p.content(icon, None, x, w, if muted { pal.fg_dim } else { ink });
++            }
+             c.restore().unwrap();
+             // A hairline level meter along the bottom of the pill.
+             let (bx, bw, by) = (x + 16.0, w - 32.0, m.h - MARGIN_Y - 6.0);
+@@ -288,6 +456,9 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+             c.fill().unwrap();
+         }
+         Kind::Nowplaying => {
++            if p.outline {
++                p.pill(x, w, pal.surface);
++            }
+             let Some(title) = m.text("title") else { return };
+             let bg_mode = m.layout.settings.nowplaying.as_str();
+             // The live spectrum runs behind the title, quietly.
+@@ -306,9 +477,18 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+                 rounded(c, x, MARGIN_Y, w, m.h - 2.0 * MARGIN_Y, RADIUS);
+                 c.fill().unwrap();
+             }
++            let note = if m.flag("playing") { "󰝚" } else { "󰏤" };
++            // yumi: подпись 音楽 со значком ноты слева, текст — в оставшемся месте
++            let (x, w) = match it.caption.as_deref() {
++                Some(cp) => {
++                    let cw = p.caption_w(Some(note), cp, false);
++                    p.caption(Some(note), cp, x + 16.0 + cw / 2.0, pal.fg, false);
++                    (x + cw + 22.0, w - cw - 22.0)
++                }
++                None => (x, w),
++            };
+             let artist = m.text("artist");
+             let cy = m.h / 2.0;
+-            let note = if m.flag("playing") { "󰝚" } else { "󰏤" };
+             let text = match artist {
+                 Some(a) => format!("{title}  ·  {a}"),
+                 None => title.to_string(),
+@@ -316,7 +496,9 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+             // The cover, when there is one, sits to the left of everything.
+             let art = if bg_mode != "off" { m.art.as_ref() } else { None };
+             let side = m.h - 2.0 * MARGIN_Y - 6.0;
+-            let nw = if art.is_some() { side } else { p.text_width(note, 30.0, false) };
++            // yumi: с подписью 音楽 нота уже есть над знаком — большую не повторять
++            let show_note = it.caption.is_none();
++            let nw = if art.is_some() { side } else if show_note { p.text_width(note, 30.0, false) } else { 0.0 };
+             let full = p.text_width(&text, LABEL_PX, false);
+             let avail = (w - nw - 30.0).max(20.0);
+             let scrolling = full > avail;
+@@ -334,7 +516,7 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+                 c.set_source_surface(img, 0.0, 0.0).unwrap();
+                 c.paint().unwrap();
+                 c.restore().unwrap();
+-            } else {
++            } else if show_note {
+                 pal.accent.set(c);
+                 p.text(note, 30.0, false, start + nw / 2.0, cy, None);
+             }
+@@ -353,7 +535,7 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+                 c.restore().unwrap();
+             } else if m.karaoke_active() {
+                 m.marquee.set(m.flag("playing"));
+-                draw_lyrics(m, p, pal, x + nw + 24.0, w - nw - 34.0, cy, LABEL_PX, false, now);
++                draw_lyric_line(m, p, pal, x + nw + 24.0, w - nw - 34.0, cy, now);
+             } else if scrolling {
+                 draw_marquee(m, p, pal, &text, full, tx, avail, now);
+             } else {
+@@ -401,16 +583,24 @@ fn draw_item(m: &Model, p: &Painter, pal: &Palette, it: &Item, n: usize, x: f64,
+                 let unit = m.text("weather_wind_unit").unwrap_or("km/h");
+                 (format!("{v:.0} {unit}"), m.num("weather_wind_dir"))
+             });
+-            let iw = p.text_width(&icon, ICON_PX, false);
++            let cap = it.caption.as_deref();
++            let iw = match cap {
++                Some(cp) => p.caption_w(Some(&icon), cp, false),
++                None => p.text_width(&icon, ICON_PX, false),
++            };
+             let tw = p.text_width(&temp, LABEL_PX, true);
+             let gap = 8.0;
+             let arrow = 26.0;
+             let ww = wind.as_ref().map_or(0.0, |(t, _)| 14.0 + arrow + 4.0 + p.text_width(t, 22.0, true));
+             let mut cx = x + (w - iw - gap - tw - ww) / 2.0;
+             let cy = m.h / 2.0;
+-            (if stale { tint.mix(pal.fg_dim, 0.6) } else { tint }).set(c);
+-            p.text(&icon, ICON_PX, false, cx + iw / 2.0, cy, None);
+-            cx += iw + gap;
++            if let Some(cp) = cap {
++                p.caption(Some(&icon), cp, cx + iw / 2.0, if stale { pal.fg_dim } else { pal.fg }, false);
++            } else {
++                (if stale { tint.mix(pal.fg_dim, 0.6) } else { tint }).set(c);
++                p.text(&icon, ICON_PX, false, cx + iw / 2.0, cy, None);
++            }
++            cx += iw + gap + if cap.is_some() { 6.0 } else { 0.0 };
+             (if stale { pal.fg_dim } else { ink }).set(c);
+             p.text(&temp, LABEL_PX, true, cx + tw / 2.0, cy, None);
+             cx += tw + 14.0;
+@@ -623,6 +813,131 @@ fn draw_finger(m: &Model, p: &Painter, pal: &Palette, alpha: f64, now: Instant)
+     c.restore().unwrap();
+ }
+ 
++// ---- yumi (19.10.2026): окно Touch ID «Печать» в стиле экрана блокировки «Свиток» ----
++// Вся полоса: 指/紋 столбиком, линия 1 px, знак состояния (待機 確認 再試行 拒否) и подсказка с засечками,
++// справа печать 弓 米 (PNG с экрана блокировки). Ждёт — печать «дышит»; узнан — штамп и растворение;
++// промах — красным и встряска как у поля пароля (−10 +10 −10 +10 0 по 90 мс).
++
++thread_local! {
++    static PNGS: std::cell::RefCell<std::collections::HashMap<String, Option<cairo::ImageSurface>>> =
++        std::cell::RefCell::new(std::collections::HashMap::new());
++}
++
++/// PNG по пути, читается один раз (печать Touch ID, image у кнопок). Службе закрыт ~ — путь из /usr/local/share.
++fn png(path: &str) -> Option<cairo::ImageSurface> {
++    if path.is_empty() {
++        return None;
++    }
++    PNGS.with(|cell| {
++        cell.borrow_mut()
++            .entry(path.to_string())
++            .or_insert_with(|| {
++                let img = fs::File::open(path).ok().and_then(|mut f| cairo::ImageSurface::create_from_png(&mut f).ok());
++                if img.is_none() {
++                    eprintln!("png: не удалось прочитать {path}");
++                }
++                img
++            })
++            .clone()
++    })
++}
++
++/// Текст своим шрифтом; x — левый край (или центр при center), cy — середина строки. Возвращает ширину.
++fn seal_text(c: &Context, s: &str, family: &str, weight: pango::Weight, px: f64, x: f64, cy: f64, center: bool) -> f64 {
++    let l = pangocairo::functions::create_layout(c);
++    let mut fd = pango::FontDescription::new();
++    fd.set_family(family);
++    fd.set_weight(weight);
++    fd.set_absolute_size(px * pango::SCALE as f64);
++    l.set_font_description(Some(&fd));
++    l.set_text(s);
++    let (_, lg) = l.pixel_extents();
++    let (w, h) = (lg.width() as f64, lg.height() as f64);
++    c.move_to((if center { x - w / 2.0 } else { x }).round(), (cy - h / 2.0).round());
++    pangocairo::functions::show_layout(c, &l);
++    w
++}
++
++/// Встряска поля пароля с экрана блокировки: −10, +10, −10, +10, 0 px по 90 мс.
++fn lock_shake(d: f64) -> f64 {
++    if !(0.0..0.45).contains(&d) {
++        return 0.0;
++    }
++    let k = [0.0, -10.0, 10.0, -10.0, 10.0, 0.0];
++    let i = ((d / 0.09) as usize).min(4);
++    let f = d / 0.09 - i as f64;
++    k[i] + (k[i + 1] - k[i]) * f
++}
++
++fn draw_finger_seal(m: &Model, p: &Painter, pal: &Palette, alpha: f64, now: Instant) {
++    const JP: &str = "Noto Serif CJK JP";
++    const SERIF: &str = "Noto Serif";
++    let c = p.c;
++    let f = &m.finger;
++    let state = if f.state == FingerState::Idle { f.shown_state } else { f.state };
++    let t = (now - f.shown_at).as_secs_f64();
++    let d = (now - f.since).as_secs_f64();
++    let rd = f.retry_at.map(|r| (now - r).as_secs_f64());
++    let missing = state == FingerState::Scan && rd.is_some_and(|r| r < 1.6);
++    let bad = matches!(state, FingerState::Fail | FingerState::Error);
++    let shake = rd.map(lock_shake).unwrap_or(0.0);
++    // «узнан»: держится 0,3 с и растворяется за 0,8 с (демон снимает окно через 1,1 с)
++    let k = alpha * if state == FingerState::Match { 1.0 - ((d - 0.3) / 0.8).clamp(0.0, 1.0) } else { 1.0 };
++    let tone = if bad || missing { pal.red } else { pal.fg };
++    let (label, hint) = match state {
++        FingerState::Match => ("確認", "Подтверждено"),
++        FingerState::Error => ("拒否", "Введите пароль"),
++        FingerState::Fail => ("拒否", "Отпечаток не распознан"),
++        _ if missing => ("再試行", "Отпечаток не распознан"),
++        _ => ("待機", "Коснитесь Touch ID"),
++    };
++
++    // фон: вся полоса чёрная на всё время Touch ID (19.10: при 92 % раскладка просвечивала)
++    c.save().unwrap();
++    c.set_source_rgba(0.0, 0.0, 0.0, k);
++    c.rectangle(0.0, 0.0, m.w, m.h);
++    c.fill().unwrap();
++
++    let cy = m.h / 2.0;
++    pal.fg.set_a(c, 0.75 * k);
++    seal_text(c, "指", JP, pango::Weight::Medium, 22.0, 36.0, cy - 12.0, true);
++    seal_text(c, "紋", JP, pango::Weight::Medium, 22.0, 36.0, cy + 12.0, true);
++    pal.fg.set_a(c, 0.35 * k);
++    c.rectangle(64.0, 10.0, 1.0, m.h - 20.0);
++    c.fill().unwrap();
++
++    pal.fg.set_a(c, 0.5 * k);
++    let x = 86.0;
++    let w = seal_text(c, "認証", JP, pango::Weight::Medium, 15.0, x, 17.0, false);
++    tone.set_a(c, if bad || missing { k } else { 0.7 * k });
++    seal_text(c, label, JP, pango::Weight::Medium, 15.0, x + w + 12.0, 17.0, false);
++    tone.set_a(c, if bad || missing || state == FingerState::Match { k } else { 0.6 * k });
++    seal_text(c, hint, SERIF, pango::Weight::Normal, 21.0, x + shake, 41.0, false);
++
++    // печать у датчика
++    if let Some(img) = png(&m.layout.settings.touchid_seal) {
++        let size = 44.0;
++        let (iw, ih) = (img.width() as f64, img.height() as f64);
++        let (a, s) = match state {
++            FingerState::Match => {
++                let e = 1.0 - (1.0 - (d / 0.18).clamp(0.0, 1.0)).powi(3);
++                (1.0, 1.0 + 0.22 * (1.0 - e))
++            }
++            // 19.10: ярче — при 12–26 % печать была едва видна
++            FingerState::Scan if !missing => (0.40 + 0.35 * (t * 1.8).sin().powi(2), 1.0),
++            _ => (0.35, 1.0),
++        };
++        let sz = size * s;
++        c.save().unwrap();
++        c.translate(m.w - 58.0 + shake, cy);
++        c.scale(sz / iw, sz / ih);
++        c.set_source_surface(&img, -iw / 2.0, -ih / 2.0).unwrap();
++        c.paint_with_alpha(a * k).unwrap();
++        c.restore().unwrap();
++    }
++    c.restore().unwrap();
++}
++
+ fn chevron(c: &Context, x: f64, cy: f64, w: f64, h: f64) {
+     c.set_line_width(3.5);
+     c.set_line_cap(cairo::LineCap::Round);
+@@ -695,14 +1010,17 @@ pub fn draw_bars(m: &Model, c: &Context, pal: &Palette, x: f64, y: f64, w: f64,
+     }
+ }
+ 
+-/// A plugin's latest frame, scaled into a rounded pill; a placeholder until one arrives.
++/// A plugin's latest frame, scaled into a rounded pill. Until a fresh one arrives, the last
++/// frame it ever sent at this size is shown as is (no flash on a layer switch); with none at
++/// all, an empty pill breathes quietly (surface → a touch lighter) instead of the plugin's name.
+ fn draw_surface(m: &Model, p: &Painter, pal: &Palette, id: &str, x: f64, w: f64, now: Instant) {
+     let c = p.c;
+     let (y, h) = (MARGIN_Y, m.h - 2.0 * MARGIN_Y);
+     c.save().unwrap();
+     rounded(c, x, y, w, h, RADIUS);
+     c.clip();
+-    match m.surface(id, now) {
++    let fits = |s: &&cairo::ImageSurface| (s.width() as f64 - w).abs() <= 1.0 && s.height() as f64 == m.h;
++    match m.surface(id, now).or_else(|| m.last_surface(id).filter(fits)) {
+         Some(surf) => {
+             let sx = w / surf.width() as f64;
+             let sy = m.h / surf.height() as f64;
+@@ -713,10 +1031,24 @@ fn draw_surface(m: &Model, p: &Painter, pal: &Palette, id: &str, x: f64, w: f64,
+             c.paint().unwrap();
+         }
+         None => {
+-            pal.surface.mix(pal.bg, 0.4).set(c);
++            p.waited.set(true);
++            let t = (now - m.waiting.get().unwrap_or(now)).as_secs_f64();
++            // Breathing fades out over WAIT_PULSE, so a plugin that never answers costs no frames.
++            let calm = (1.0 - t / WAIT_PULSE.as_secs_f64()).clamp(0.0, 1.0);
++            let k = 0.5 - 0.5 * (t * 2.0 * PI / 1.6).cos();
++            pal.surface.mix(pal.surface_hi, 0.30 * k * calm).set(c);
+             c.paint().unwrap();
+-            pal.fg_dim.set(c);
+-            p.text(id, LABEL_PX * 0.8, false, x + w / 2.0, m.h / 2.0, Some(w - 12.0));
++            if calm > 0.0 {
++                // A soft sheen drifting left to right, no text.
++                let band = (w * 0.35).clamp(60.0, 260.0);
++                let sx = x - band + ((t / 1.6).fract()) * (w + 2.0 * band);
++                let g = LinearGradient::new(sx - band / 2.0, 0.0, sx + band / 2.0, 0.0);
++                g.add_color_stop_rgba(0.0, pal.fg.0, pal.fg.1, pal.fg.2, 0.0);
++                g.add_color_stop_rgba(0.5, pal.fg.0, pal.fg.1, pal.fg.2, 0.06 * calm);
++                g.add_color_stop_rgba(1.0, pal.fg.0, pal.fg.1, pal.fg.2, 0.0);
++                c.set_source(&g).unwrap();
++                c.paint().unwrap();
++            }
+         }
+     }
+     c.restore().unwrap();
+@@ -779,7 +1111,7 @@ fn draw_viz(m: &Model, p: &Painter, pal: &Palette, v: &VizOverlay, now: Instant)
+                 // Lit up while karaoke is on.
+                 let on = m.flag("karaoke");
+                 p.pill(x, w, if on { pal.accent.mix(pal.surface, 0.35) } else { pal.surface.mix(pal.accent, 0.45 * pl) });
+-                p.content(Some("\u{F036C}"), None, x, w, if on { pal.bg } else { pal.fg });
++                p.content(Some("\u{F09A8}"), None, x, w, if on { pal.bg } else { pal.fg });   // yumi: «строки текста», а не микрофон
+             }
+             Part::Mode => {
+                 let icon = match v.mode.as_str() {
+@@ -980,6 +1312,47 @@ fn draw_weather(m: &Model, p: &Painter, pal: &Palette, now: Instant) {
+                     p.text(place, 14.0, false, rx + pw / 2.0, cy + 12.0, Some(right_w - 8.0));
+                 }
+             }
++            Part::WHours if m.weather_days => {
++                // yumi: 12 days — [label, icon, max, min, precip %, kind]
++                let days: Vec<&serde_json::Value> = m
++                    .state
++                    .get("weather_days")
++                    .and_then(|v| v.as_array())
++                    .map(|a| a.iter().collect())
++                    .unwrap_or_default();
++                if days.is_empty() {
++                    continue;
++                }
++                let n = ((w / 96.0) as usize).clamp(1, days.len());
++                let col = w / n as f64;
++                for (i, d) in days.iter().take(n).enumerate() {
++                    let Some(d) = d.as_array() else { continue };
++                    let get_s = |k: usize| d.get(k).and_then(|v| v.as_str()).unwrap_or("");
++                    let (label, icon, kind) = (get_s(0), get_s(1), get_s(5));
++                    let hi = d.get(2).and_then(|v| v.as_f64());
++                    let lo = d.get(3).and_then(|v| v.as_f64());
++                    let pop = d.get(4).and_then(|v| v.as_f64()).unwrap_or(0.0);
++                    let cx = x + col * (i as f64 + 0.5);
++                    (if i % 2 == 0 { pal.surface } else { pal.surface.mix(pal.bg, 0.4) }).set(c);
++                    rounded(c, x + col * i as f64 + 2.0, MARGIN_Y, col - 4.0, m.h - 2.0 * MARGIN_Y, RADIUS);
++                    c.fill().unwrap();
++                    pal.fg_dim.mix(pal.fg, 0.3).set(c);
++                    let top = if pop >= 20.0 { format!("{label}  {pop:.0}%") } else { label.to_string() };
++                    p.text(&top, 14.0, true, cx, cy - 13.0, Some(col - 8.0));
++                    let t = match (hi, lo) {
++                        (Some(h), Some(l)) => format!("{h:.0}°/{l:.0}°"),
++                        (Some(h), None) => format!("{h:.0}°"),
++                        _ => String::new(),
++                    };
++                    let iw = p.text_width(icon, 22.0, false);
++                    let tw = p.text_width(&t, 15.0, true);
++                    let sx = cx - (iw + 5.0 + tw) / 2.0;
++                    weather_tint(pal, kind).set(c);
++                    p.text(icon, 22.0, false, sx + iw / 2.0, cy + 10.0, None);
++                    pal.fg.set(c);
++                    p.text(&t, 15.0, true, sx + iw + 5.0 + tw / 2.0, cy + 10.0, None);
++                }
++            }
+             Part::WHours => {
+                 let hours: Vec<&serde_json::Value> = m
+                     .state
+@@ -1670,7 +2043,56 @@ const FONT_5X7: [[u8; 5]; 95] = [
+ 
+ /// A character's 5x7 columns: ASCII directly, common accents folded to their
+ /// base letter, the middle dot as a dot. None if the font can't show it.
++/// yumi (16.10): Cyrillic in the 5x7 pixel font (Russian + Ukrainian І Ї Є Ґ). Lower case is drawn as small caps
++/// (the upper-case glyph), as many pixel fonts do. Before this, Russian titles fell back to the smooth font.
++fn glyph_cyr(ch: char) -> Option<[u8; 5]> {
++    let up = ch.to_uppercase().next().unwrap_or(ch);
++    Some(match up {
++        'А' => [0x7E, 0x09, 0x09, 0x09, 0x7E],
++        'Б' => [0x7F, 0x49, 0x49, 0x49, 0x31],
++        'В' => [0x7F, 0x49, 0x49, 0x49, 0x36],
++        'Г' => [0x7F, 0x01, 0x01, 0x01, 0x01],
++        'Д' => [0x60, 0x3F, 0x21, 0x21, 0x7F],
++        'Е' => [0x7F, 0x49, 0x49, 0x49, 0x41],
++        'Ё' => [0x7E, 0x4B, 0x4A, 0x4B, 0x42],
++        'Ж' => [0x77, 0x08, 0x7F, 0x08, 0x77],
++        'З' => [0x22, 0x41, 0x49, 0x49, 0x36],
++        'И' => [0x7F, 0x10, 0x08, 0x04, 0x7F],
++        'Й' => [0x7E, 0x11, 0x08, 0x05, 0x7E],
++        'К' => [0x7F, 0x08, 0x14, 0x22, 0x41],
++        'Л' => [0x40, 0x3E, 0x01, 0x01, 0x7F],
++        'М' => [0x7F, 0x02, 0x0C, 0x02, 0x7F],
++        'Н' => [0x7F, 0x08, 0x08, 0x08, 0x7F],
++        'О' => [0x3E, 0x41, 0x41, 0x41, 0x3E],
++        'П' => [0x7F, 0x01, 0x01, 0x01, 0x7F],
++        'Р' => [0x7F, 0x09, 0x09, 0x09, 0x06],
++        'С' => [0x3E, 0x41, 0x41, 0x41, 0x22],
++        'Т' => [0x01, 0x01, 0x7F, 0x01, 0x01],
++        'У' => [0x27, 0x48, 0x48, 0x48, 0x3F],
++        'Ф' => [0x1C, 0x22, 0x7F, 0x22, 0x1C],
++        'Х' => [0x63, 0x14, 0x08, 0x14, 0x63],
++        'Ц' => [0x3F, 0x20, 0x20, 0x3F, 0x60],
++        'Ч' => [0x07, 0x08, 0x08, 0x08, 0x7F],
++        'Ш' => [0x7F, 0x40, 0x7F, 0x40, 0x7F],
++        'Щ' => [0x3F, 0x20, 0x3F, 0x20, 0x7F],
++        'Ъ' => [0x01, 0x7F, 0x48, 0x48, 0x30],
++        'Ы' => [0x7F, 0x48, 0x30, 0x00, 0x7F],
++        'Ь' => [0x7F, 0x48, 0x48, 0x48, 0x30],
++        'Э' => [0x22, 0x49, 0x49, 0x49, 0x3E],
++        'Ю' => [0x7F, 0x08, 0x3E, 0x41, 0x3E],
++        'Я' => [0x46, 0x29, 0x19, 0x09, 0x7F],
++        'Є' => [0x3E, 0x49, 0x49, 0x49, 0x22],
++        'І' => [0x00, 0x41, 0x7F, 0x41, 0x00],
++        'Ї' => [0x00, 0x41, 0x7C, 0x41, 0x00],
++        'Ґ' => [0x7E, 0x02, 0x02, 0x02, 0x03],
++        _ => return None,
++    })
++}
++
+ fn glyph_5x7(ch: char) -> Option<[u8; 5]> {
++    if let Some(g) = glyph_cyr(ch) {
++        return Some(g);
++    }
+     let base = match ch {
+         '·' | '•' => return Some([0x00, 0x00, 0x08, 0x00, 0x00]),
+         '–' | '—' => '-',
+@@ -1938,7 +2360,7 @@ fn draw_toast(p: &Painter, pal: &Palette, m: &Model, msg: &str, age: f64) {
+     c.set_line_width(1.5);
+     c.stroke().unwrap();
+     pal.fg.set(c);
+-    p.text("\u{F036C}", 24.0, false, x + 26.0, m.h / 2.0, None);
++    p.text("\u{F09A8}", 24.0, false, x + 26.0, m.h / 2.0, None);
+     p.text(msg, 24.0, true, x + 40.0 + (tw - 52.0) / 2.0, m.h / 2.0, None);
+     c.pop_group_to_source().unwrap();
+     c.paint_with_alpha(a).unwrap();
+@@ -1949,6 +2371,60 @@ fn draw_toast(p: &Painter, pal: &Palette, m: &Model, msg: &str, age: f64) {
+ /// others are dimmed. Each line holds still while it's sung, then glides to
+ /// the next. In full-screen mode the current line also bounces to the beat.
+ #[allow(clippy::too_many_arguments)]
++/// yumi (16.10): the lyrics as in music players — just the current line, centred, the next one cross-fading in
++/// (0.3 s). Replaces the karaoke ribbon on the bar's "now playing"; the full-screen visualiser keeps draw_lyrics.
++fn draw_lyric_line(m: &Model, p: &Painter, pal: &Palette, x: f64, w: f64, cy: f64, now: Instant) {
++    let c = p.c;
++    let lines = m.lyrics();
++    let Some((pos, _len)) = m.position(now) else { return };
++    let pos = pos + m.lyrics_offset();
++    if lines.is_empty() || w <= 0.0 {
++        return;
++    }
++    let cur = lines.iter().rposition(|(t, _)| *t <= pos);
++    let line_of = |i: Option<usize>| -> String {
++        match i {
++            Some(i) => {
++                let l = lines[i].1.trim();
++                if l.is_empty() { "♪".to_string() } else { l.to_string() }
++            }
++            None => "♪".to_string(),
++        }
++    };
++    let since = cur.map(|i| pos - lines[i].0).unwrap_or(f64::MAX);
++    let k = (since / 0.3).clamp(0.0, 1.0);
++    let k = k * k * (3.0 - 2.0 * k);
++    c.save().unwrap();
++    c.rectangle(x, MARGIN_Y, w, m.h - 2.0 * MARGIN_Y);
++    c.clip();
++    let draw = |text: &str, alpha: f64, dy: f64| {
++        if alpha <= 0.0 {
++            return;
++        }
++        // shrink a long line down to 18 px before cutting it with an ellipsis
++        let mut px = LABEL_PX;
++        while px > 18.0 && p.text_width(text, px, false) > w - 8.0 {
++            px -= 1.0;
++        }
++        c.push_group();
++        pal.fg.set(c);
++        p.text(text, px, false, x + w / 2.0, cy + dy, Some(w - 8.0));
++        c.pop_group_to_source().unwrap();
++        c.paint_with_alpha(alpha).unwrap();
++    };
++    if k < 1.0 {
++        // the previous line slides up and fades, the new one rises in
++        let prev = cur.and_then(|i| i.checked_sub(1));
++        if cur.is_some() {
++            draw(&line_of(prev), (1.0 - k) * (1.0 - k), -26.0 * k);
++        }
++        draw(&line_of(cur), k * k, 26.0 * (1.0 - k));
++    } else {
++        draw(&line_of(cur), 1.0, 0.0);
++    }
++    c.restore().unwrap();
++}
++
+ fn draw_lyrics(m: &Model, p: &Painter, pal: &Palette, x: f64, w: f64, cy: f64, px: f64, full: bool, now: Instant) {
+     let c = p.c;
+     let lines = m.lyrics();
+diff --git a/daemon/src/ui.rs b/daemon/src/ui.rs
+index 3539e75..f525d37 100644
+--- a/daemon/src/ui.rs
++++ b/daemon/src/ui.rs
+@@ -18,8 +18,25 @@ pub const FP_FADE_OUT: Duration = Duration::from_millis(280);
+ const BARS_STALE: Duration = Duration::from_millis(400);
+ /// Plugin frames older than this are treated as gone.
+ pub const PIXELS_STALE: Duration = Duration::from_millis(1500);
++/// The last frame of each plugin is kept this long after it went stale: when the
++/// surface comes back (layer switch, slider closed), it is drawn at once instead
++/// of a placeholder, until the plugin sends a fresh one.
++pub const PIXELS_KEEP: Duration = Duration::from_secs(600);
++/// A surface still waiting for its first frame breathes quietly this long, then rests.
++pub const WAIT_PULSE: Duration = Duration::from_secs(6);
+ /// mirror, floor+peaks, dots, ripple, aurora, pixels, comet
+ pub const BAR_STYLES: u8 = 7;
++/// yumi (19.10): слой едет за пальцем с таким коэффициентом.
++pub const SWIPE_FOLLOW: f64 = 0.5;
++/// yumi: зазор между уезжающим и въезжающим слоем, px.
++pub const SWIPE_GAP: f64 = 24.0;
++/// yumi: индикатор слоя виден столько после переключения.
++const BADGE_FOR: Duration = Duration::from_millis(800);
++/// yumi: на слоях со свайпом кнопка-клавиша нажимается не сразу, а через столько
++/// (или при отпускании) — чтобы свайп, начатый на ⏯ или F-клавише, ничего не нажимал.
++// yumi (19.10): было 120 мс — на ⏮⏯⏭/mute палец успевал «нажать» (пауза), прежде чем поехать в свайп.
++// Тап не замедляется: короткое касание жмёт клавишу при отпускании. Задержка — только для удержания.
++const KEY_DEFER: Duration = Duration::from_millis(350);
+ /// Colour moods for the visualisers, in the order the mood button cycles.
+ pub const MOODS: [&str; 9] = ["music", "mono", "smoke", "amethyst", "matrix", "disco", "rasta", "rainbow", "theme"];
+ /// dot matrix, wave, outline, typewriter, scatter, blocks, sparkle, explode
+@@ -86,9 +103,28 @@ enum Grab {
+     Scrub { start_x: f64, moved: bool },
+     /// Setting the volume on the control drawn over the visualiser.
+     Volume,
++    /// yumi: swiping across the weather forecast flips between 12 hours and 12 days.
++    WSwipe { start_x: f64, done: bool },
++    /// yumi (19.10): длинный свайп между слоями из кольца `swipe_layers`.
++    Swipe { start_x: f64 },
++    /// yumi (19.10): свайп слоёв двумя пальцами — оба касания ведут один свайп (Model::two).
++    TwoFinger,
+     Ignore,
+ }
+ 
++/// yumi (19.10): анимация после свайпа — переключение на соседний слой или возврат на место.
++pub struct SwipeAnim {
++    /// Слой, который едет (при переключении — старый, уезжающий).
++    pub base: String,
++    /// Соседний слой у края.
++    pub other: String,
++    /// Сдвиг `base` в начале и в конце, px.
++    pub from: f64,
++    pub to: f64,
++    pub start: Instant,
++    pub dur: Duration,
++}
++
+ pub struct SliderOverlay {
+     pub item: Item,
+     pub key: String,
+@@ -127,6 +163,8 @@ pub struct Model {
+     pub viz: Option<VizOverlay>,
+     /// The expanded weather view, with when it was last touched.
+     pub weather: Option<Instant>,
++    /// yumi: the expanded weather shows 12 days instead of 12 hours (flipped by a swipe).
++    pub weather_days: bool,
+     pub finger: Finger,
+     pub pressed: HashMap<Hit, (bool, Instant)>,
+     pub bars: Vec<f32>,
+@@ -162,8 +200,33 @@ pub struct Model {
+     pub palette_at: Instant,
+     /// Set by the renderer while a long title is scrolling, so frames keep coming.
+     pub marquee: std::cell::Cell<bool>,
++    /// Set by the renderer while a plugin surface has no frame yet: since when.
++    pub waiting: std::cell::Cell<Option<Instant>>,
++    /// yumi (19.10): идёт свайп между слоями — сдвиг пальца по X от точки касания.
++    pub swipe: Option<f64>,
++    pub swipe_anim: Option<SwipeAnim>,
++    /// До какого момента виден индикатор «Имя ● ○ ○» после переключения.
++    pub badge_until: Option<Instant>,
++    /// Слой приложения (прислал агент), временно стоящий в позиции 0 кольца вместо default.
++    pub home_override: Option<String>,
++    /// Пока рендерер рисует слой в движении: без подсветки нажатий (индексы чужие).
++    pub ghost: std::cell::Cell<bool>,
+     grabs: HashMap<u32, Grab>,
+     hold: HashMap<String, Instant>,
++    /// Касания, которые ещё могут стать свайпом: где палец встал.
++    swipe_from: HashMap<u32, f64>,
++    /// Касания кнопок-клавиш, чей KeyDown отложен (см. KEY_DEFER): когда нажать.
++    deferred: HashMap<u32, Instant>,
++    /// yumi (19.10): где сейчас каждый палец (нужно, чтобы второй палец подхватил первый в свайп).
++    last_x: HashMap<u32, f64>,
++    /// yumi (19.10): свайп двумя пальцами — откуда считать (среднее при касании второго) и где пальцы сейчас.
++    two: Option<TwoFinger>,
++}
++
++/// yumi (19.10): свайп слоёв двумя пальцами — с любого места, даже с ползунков и ⏮⏯⏭.
++struct TwoFinger {
++    start: f64,
++    xs: HashMap<u32, f64>,
+ }
+ 
+ impl Model {
+@@ -181,6 +244,7 @@ impl Model {
+             slider: None,
+             viz: None,
+             weather: None,
++            weather_days: false,
+             finger: Finger {
+                 state: FingerState::Idle,
+                 shown_state: FingerState::Scan,
+@@ -212,8 +276,18 @@ impl Model {
+             time_rect: std::cell::Cell::new((0.0, 0.0)),
+             palette_at: now,
+             marquee: std::cell::Cell::new(false),
++            waiting: std::cell::Cell::new(None),
++            swipe: None,
++            swipe_anim: None,
++            badge_until: None,
++            home_override: None,
++            ghost: std::cell::Cell::new(false),
+             grabs: HashMap::new(),
+             hold: HashMap::new(),
++            swipe_from: HashMap::new(),
++            deferred: HashMap::new(),
++            last_x: HashMap::new(),
++            two: None,
+         }
+     }
+ 
+@@ -223,6 +297,9 @@ impl Model {
+             self.layer = layout.default.clone();
+         }
+         self.layout = layout;
++        self.home_override = None;
++        self.swipe_anim = None;
++        self.badge_until = None;
+         self.slider = None;
+         self.weather = None;
+         self.weather = None;
+@@ -258,11 +335,200 @@ impl Model {
+         if self.layout.layers.contains_key(name) {
+             self.layer = name.to_string();
+         }
++        self.swipe_anim = None;
+         self.slider = None;
+         fx.extend(self.close_viz());
+         fx
+     }
+ 
++    /// yumi (19.10): слой от агента (окно в фокусе). Слой не из кольца — «домашний»:
++    /// встаёт в позицию 0 кольца; default или слой из кольца снимают подмену.
++    pub fn agent_layer(&mut self, name: &str) -> Vec<Effect> {
++        let s = &self.layout.settings;
++        if name == self.layout.default || s.swipe_layers.iter().any(|l| l == name) {
++            self.home_override = None;
++        } else if self.layout.layers.contains_key(name) {
++            self.home_override = Some(name.to_string());
++        }
++        self.switch_layer(name)
++    }
++
++    // ---- yumi: свайп между слоями -----------------------------------------
++
++    /// Кольцо слоёв: только существующие, от двух; слой приложения — на месте 0.
++    pub fn swipe_ring(&self) -> Vec<String> {
++        let mut ring: Vec<String> = self
++            .layout
++            .settings
++            .swipe_layers
++            .iter()
++            .filter(|l| self.layout.layers.contains_key(*l))
++            .cloned()
++            .collect();
++        if ring.len() < 2 {
++            return vec![];
++        }
++        // yumi (19.10, правка): слой приложения встаёт ПЕРЕД главным, а не вместо него — иначе, уйдя с него
++        // кнопкой 󰕮 на главный, получали слой не из кольца и свайп с главного был запрещён.
++        if let Some(h) = &self.home_override {
++            if self.layout.layers.contains_key(h) && !ring.contains(h) {
++                ring.insert(0, h.clone());
++            }
++        }
++        ring
++    }
++
++    /// Соседний слой по кольцу: dir = 1 — следующий (свайп влево), -1 — предыдущий.
++    pub fn swipe_neighbor(&self, dir: i32) -> Option<String> {
++        let ring = self.swipe_ring();
++        let p = ring.iter().position(|l| *l == self.layer)? as i32;
++        Some(ring[(p + dir).rem_euclid(ring.len() as i32) as usize].clone())
++    }
++
++    /// Можно ли сейчас начать свайп: обычный слой из кольца, без overlay и Fn.
++    fn swipe_allowed(&self) -> bool {
++        !self.fn_held
++            && !self.overlay_open()
++            && self.sync_open.is_none()
++            && self.swipe_ring().contains(&self.layer)
++    }
++
++    /// yumi (19.10): второй палец может начать свайп двумя пальцами: слой из кольца, без Fn/сдвига текста,
++    /// погода и визуализатор закрыты; открытый ползунок — только если его открыл этот же первый палец.
++    fn two_allowed(&self, other: Option<&Grab>) -> bool {
++        !self.fn_held
++            && self.sync_open.is_none()
++            && self.weather.is_none()
++            && self.viz.is_none()
++            && self.swipe_ring().contains(&self.layer)
++            && (self.slider.is_none() || matches!(other, Some(Grab::SliderDrag { .. })))
++    }
++
++    /// yumi (19.10): коснулся второй палец — отменить то, что начал первый (клавишу отпустить, ползунок
++    /// закрыть и вернуть значение), и вести свайп слоёв по среднему двух пальцев. None — не наш случай.
++    fn try_two_finger(&mut self, slot: u32, x: f64) -> Option<Vec<Effect>> {
++        if self.two.is_some() || self.grabs.len() != 1 {
++            return None;
++        }
++        let other = *self.grabs.keys().next()?;
++        if other == slot || !self.two_allowed(self.grabs.get(&other)) {
++            return None;
++        }
++        let mut fx = vec![];
++        let deferred = self.deferred.remove(&other).is_some();
++        self.swipe_from.remove(&other);
++        match self.grabs.remove(&other) {
++            Some(Grab::Press { hit, keys, inside, .. }) => {
++                self.pressed.remove(&hit);
++                if inside && !deferred && !keys.is_empty() {
++                    fx.push(Effect::KeyUp(keys));
++                }
++            }
++            Some(Grab::SliderDrag { start_v, moved, .. }) => {
++                if moved {
++                    if let Some(key) = self.slider.as_ref().map(|s| s.key.clone()) {
++                        fx.push(self.set_value(&key, start_v));
++                    }
++                }
++                self.slider = None;
++            }
++            _ => {}
++        }
++        let ox = self.last_x.get(&other).copied().unwrap_or(x);
++        self.two = Some(TwoFinger { start: (ox + x) / 2.0, xs: HashMap::from([(other, ox), (slot, x)]) });
++        self.grabs.insert(other, Grab::TwoFinger);
++        self.grabs.insert(slot, Grab::TwoFinger);
++        self.swipe_anim = None;
++        self.swipe = Some(0.0);
++        Some(fx)
++    }
++
++    /// Палец прошёл порог длинного свайпа.
++    pub fn swipe_passed(&self, dx: f64) -> bool {
++        dx.abs() >= self.layout.settings.swipe_min * self.w
++    }
++
++    /// Подпись слоя: из `layer_names`, иначе ключ.
++    pub fn layer_title(&self, name: &str) -> String {
++        self.layout.settings.layer_names.get(name).cloned().unwrap_or_else(|| name.to_string())
++    }
++
++    /// Что рисовать в движении: (слой, его сдвиг, соседний слой у края).
++    pub fn swipe_view(&self, now: Instant) -> Option<(String, f64, Option<String>)> {
++        if let Some(dx) = self.swipe {
++            let off = dx * SWIPE_FOLLOW;
++            let other = if off == 0.0 { None } else { self.swipe_neighbor(if off < 0.0 { 1 } else { -1 }) };
++            return Some((self.layer.clone(), off, other));
++        }
++        let a = self.swipe_anim.as_ref()?;
++        let t = ((now - a.start).as_secs_f64() / a.dur.as_secs_f64().max(0.001)).min(1.0);
++        let e = 1.0 - (1.0 - t).powi(3);
++        Some((a.base.clone(), a.from + (a.to - a.from) * e, Some(a.other.clone())))
++    }
++
++    /// Индикатор: (подпись, номер в кольце, длина кольца) — во время свайпа и ~0,8 с после.
++    pub fn layer_badge(&self, now: Instant) -> Option<(String, usize, usize)> {
++        if self.swipe.is_none() && !self.badge_until.is_some_and(|t| now < t) {
++            return None;
++        }
++        // Во время свайпа — слой, который будет после отпускания.
++        let name = match self.swipe {
++            Some(dx) if self.swipe_passed(dx) => self.swipe_neighbor(if dx < 0.0 { 1 } else { -1 })?,
++            _ => self.layer.clone(),
++        };
++        let ring = self.swipe_ring();
++        let i = ring.iter().position(|l| *l == name)?;
++        Some((self.layer_title(&name), i, ring.len()))
++    }
++
++    /// Отпустили палец после свайпа: переключиться по кольцу или вернуть слой на место.
++    fn finish_swipe(&mut self, now: Instant) -> Vec<Effect> {
++        let mut fx = vec![];
++        let dx = self.swipe.take().unwrap_or(0.0);
++        let off = dx * SWIPE_FOLLOW;
++        let dir = if dx < 0.0 { 1 } else { -1 };
++        let dur = Duration::from_millis(self.layout.settings.swipe_anim_ms);
++        match self.swipe_neighbor(dir) {
++            Some(next) if self.swipe_passed(dx) => {
++                let from_layer = self.layer.clone();
++                fx.extend(self.switch_layer(&next));
++                self.weather = None;
++                fx.push(Effect::Send(Outgoing::Layer { name: next.clone() }));
++                self.badge_until = Some(now + BADGE_FOR);
++                self.swipe_anim = Some(SwipeAnim {
++                    base: from_layer,
++                    other: next,
++                    from: off,
++                    to: -(dir as f64) * (self.w + SWIPE_GAP),
++                    start: now,
++                    dur,
++                });
++            }
++            Some(other) if off != 0.0 => {
++                self.swipe_anim = Some(SwipeAnim { base: self.layer.clone(), other, from: off, to: 0.0, start: now, dur });
++            }
++            _ => {}
++        }
++        fx
++    }
++
++    /// Отложенные KeyDown, которым пора (палец стоит на кнопке дольше KEY_DEFER).
++    pub fn due_keys(&mut self, now: Instant) -> Vec<Effect> {
++        let due: Vec<u32> = self.deferred.iter().filter(|(_, t)| **t <= now).map(|(s, _)| *s).collect();
++        let mut fx = vec![];
++        for slot in due {
++            self.deferred.remove(&slot);
++            if let Some(Grab::Press { keys, inside: true, .. }) = self.grabs.get(&slot) {
++                if !keys.is_empty() {
++                    fx.push(Effect::KeyDown(keys.clone()));
++                    // Клавиша уже зажата — из этого касания свайп больше не начнётся.
++                    self.swipe_from.remove(&slot);
++                }
++            }
++        }
++        fx
++    }
++
+     pub fn set_fn(&mut self, held: bool) -> Vec<Effect> {
+         if self.fn_held == held {
+             return vec![];
+@@ -420,6 +686,11 @@ impl Model {
+         self.surfaces.get(id).filter(|(_, t)| now - *t < PIXELS_STALE).map(|(s, _)| s)
+     }
+ 
++    /// The newest frame a plugin ever sent (kept for PIXELS_KEEP), stale or not.
++    pub fn last_surface(&self, id: &str) -> Option<&cairo::ImageSurface> {
++        self.surfaces.get(id).map(|(s, _)| s)
++    }
++
+     /// The plugin surfaces currently on screen, with their sizes.
+     pub fn surface_specs(&self) -> Vec<SurfaceSpec> {
+         let h = self.h as u32;
+@@ -490,14 +761,7 @@ impl Model {
+         if on && !self.karaoke_active() && self.text("lyrics_status") == Some("none") {
+             self.no_lyrics_at = Some(now);
+         }
+-        let msg = match (on, self.karaoke_active(), self.text("lyrics_status")) {
+-            (false, ..) => "Karaoke mode off",
+-            (true, true, _) => "Karaoke mode on",
+-            (true, false, Some("searching")) => "Karaoke on · finding lyrics…",
+-            (true, false, Some("unavailable")) => "Karaoke on · lyrics service unreachable",
+-            (true, false, _) => "Karaoke on · no lyrics for this song",
+-        };
+-        self.toast = Some((msg.to_string(), now));
++        // yumi (16.10): без всплывашки «Karaoke mode on/off» — включённую кнопку и строку текста и так видно
+         vec![Effect::Send(Outgoing::Set { k: "karaoke".into(), v: on as u8 as f64 })]
+     }
+ 
+@@ -678,11 +942,19 @@ impl Model {
+             changed = true;
+         }
+         // Frames from plugins that stopped drawing (hidden, or gone) are dropped.
+-        self.surfaces.retain(|_, (_, t)| now - *t < PIXELS_STALE * 4);
++        self.surfaces.retain(|_, (_, t)| now - *t < PIXELS_KEEP);
+         let before = self.pressed.len();
+         self.pressed.retain(|_, (down, t)| *down || now - *t < PRESS_FADE);
+         changed |= before != self.pressed.len();
+         self.hold.retain(|_, t| *t > now);
++        if self.swipe_anim.as_ref().is_some_and(|a| now - a.start >= a.dur) {
++            self.swipe_anim = None;
++            changed = true;
++        }
++        if self.badge_until.is_some_and(|t| now >= t) {
++            self.badge_until = None;
++            changed = true;
++        }
+         changed
+     }
+ 
+@@ -699,6 +971,8 @@ impl Model {
+             || self.no_lyrics_banner(now).is_some()
+             || (self.karaoke_active() && self.flag("playing"))
+             || self.surfaces.values().any(|(_, t)| now - *t < PIXELS_STALE)
++            || self.waiting.get().is_some_and(|t| now - t < WAIT_PULSE)
++            || self.swipe_anim.is_some()
+     }
+ 
+     /// Whether anything on screen draws the spectrum right now.
+@@ -708,6 +982,11 @@ impl Model {
+     }
+ 
+     /// When `tick` next has work to do, if ever.
++    /// yumi (19.10): шаг кадра из settings.fps (10–120), раньше анимации тикали по 33 мс.
++    pub fn frame_interval(&self) -> Duration {
++        Duration::from_secs_f64(1.0 / self.layout.settings.fps.clamp(10, 120) as f64)
++    }
++
+     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+         let mut d: Option<Instant> = None;
+         let mut take = |t: Instant| d = Some(d.map_or(t, |x| x.min(t)));
+@@ -717,7 +996,13 @@ impl Model {
+             ));
+         }
+         if self.animating(now) {
+-            take(now + Duration::from_millis(33));
++            take(now + self.frame_interval());
++        }
++        if let Some(t) = self.badge_until {
++            take(t);
++        }
++        if let Some(t) = self.deferred.values().min() {
++            take(*t);
+         }
+         d
+     }
+@@ -751,8 +1036,12 @@ impl Model {
+     }
+ 
+     pub fn item_rects(&self) -> Vec<(f64, f64)> {
+-        let widths: Vec<_> = self
+-            .items()
++        self.rects_for(self.items())
++    }
++
++    /// yumi (19.10): раскладка любого слоя (для соседнего во время свайпа).
++    pub fn rects_for(&self, items: &[Item]) -> Vec<(f64, f64)> {
++        let widths: Vec<_> = items
+             .iter()
+             .map(|i| (i.w, i.flex.unwrap_or(1.0)))
+             .collect();
+@@ -909,14 +1198,33 @@ impl Model {
+         if let Some(t) = &mut self.weather {
+             *t = now;
+         }
++        self.last_x.insert(slot, x);
++        // yumi (19.10): второй палец во время свайпа ничего не делает.
++        if self.swipe.is_some() {
++            self.grabs.insert(slot, Grab::Ignore);
++            return fx;
++        }
++        // yumi (19.10): второй палец на полосе — свайп слоёв двумя пальцами, что бы ни было под первым.
++        if let Some(more) = self.try_two_finger(slot, x) {
++            fx.extend(more);
++            return fx;
++        }
++        // Новое касание во время анимации: слой сразу встаёт на место.
++        self.swipe_anim = None;
+         // The fingerprint prompt covers the right end; touches there do nothing.
++        // yumi: окно "seal" закрывает всю полосу — касания игнорируются везде.
+         if self.finger.state != FingerState::Idle
+-            && x > self.w - self.layout.settings.fingerprint_width
++            && (self.layout.settings.touchid_style == "seal" || x > self.w - self.layout.settings.fingerprint_width)
+         {
+             self.grabs.insert(slot, Grab::Ignore);
+             return fx;
+         }
++        let can_swipe = self.swipe_allowed();
+         let Some(hit) = self.hit(x) else {
++            // yumi: пустое место тоже годится для свайпа
++            if can_swipe {
++                self.swipe_from.insert(slot, x);
++            }
+             self.grabs.insert(slot, Grab::Ignore);
+             return fx;
+         };
+@@ -944,6 +1252,12 @@ impl Model {
+                 self.press(hit, true);
+                 Grab::Press { hit, keys: vec![], act: None, inside: true, tap: None }
+             }
++            // yumi (16.10): панель сдвига текста открыта — касание по плееру мимо её кнопок просто закрывает её
++            // (без паузы и перемотки)
++            Hit::Overlay(Part::Viz) if self.sync_open.is_some() => {
++                self.sync_open = None;
++                Grab::Ignore
++            }
+             Hit::Overlay(Part::Viz) if self.viz.as_ref().is_some_and(|v| v.volume.is_some()) => {
+                 fx.push(self.set_volume_at(x));
+                 Grab::Volume
+@@ -956,6 +1270,7 @@ impl Model {
+                 self.press(hit, true);
+                 Grab::Press { hit, keys: vec![], act: None, inside: true, tap: None }
+             }
++            Hit::Overlay(Part::WHours) => Grab::WSwipe { start_x: x, done: false },
+             Hit::Overlay(_) | Hit::Sync(_) => Grab::Ignore,
+             Hit::Sub(n, part) => {
+                 let item = self.items()[n].clone();
+@@ -1006,18 +1321,53 @@ impl Model {
+                 }
+             }
+         };
++        // yumi (19.10): кнопка на слое из кольца может стать свайпом (плагин с options.swipe = "own" — нет).
++        if can_swipe {
++            if let Grab::Press { hit: Hit::Item(n) | Hit::Sub(n, _), keys, .. } = &grab {
++                let own = self.items()[*n]
++                    .options
++                    .as_ref()
++                    .and_then(|o| o.get("swipe"))
++                    .and_then(|v| v.as_str())
++                    == Some("own");
++                if !own {
++                    self.swipe_from.insert(slot, x);
++                    if !keys.is_empty() {
++                        // KeyDown этой кнопки только что добавлен в fx — откладываем его.
++                        fx.retain(|e| !matches!(e, Effect::KeyDown(_)));
++                        self.deferred.insert(slot, now + KEY_DEFER);
++                    }
++                }
++            }
++        }
+         self.grabs.insert(slot, grab);
+         fx
+     }
+ 
+     pub fn touch_motion(&mut self, slot: u32, x: f64) -> Vec<Effect> {
+         let mut fx = vec![];
++        self.last_x.insert(slot, x);
+         if let Some(s) = &mut self.slider {
+             s.last_touch = Instant::now();
+         }
+         let Some(mut grab) = self.grabs.remove(&slot) else {
+             return fx;
+         };
++        // yumi (19.10): палец ушёл по X дальше swipe_start — это свайп, нажатие отменяется.
++        if let Some(&sx) = self.swipe_from.get(&slot) {
++            if (x - sx).abs() > self.layout.settings.swipe_start && self.swipe.is_none() {
++                self.swipe_from.remove(&slot);
++                let deferred = self.deferred.remove(&slot).is_some();
++                if let Grab::Press { hit, keys, inside, .. } = &grab {
++                    self.pressed.remove(hit);
++                    if *inside && !deferred && !keys.is_empty() {
++                        fx.push(Effect::KeyUp(keys.clone()));
++                    }
++                }
++                grab = Grab::Swipe { start_x: sx };
++                self.swipe = Some(0.0);
++            }
++        }
+         match &mut grab {
+             Grab::Press { hit, keys, inside, .. } => {
+                 if *inside {
+@@ -1026,12 +1376,24 @@ impl Model {
+                     if x < rx - slop || x > rx + rw + slop {
+                         *inside = false;
+                         self.press(*hit, false);
+-                        if !keys.is_empty() {
++                        // yumi: отложенная клавиша ещё не нажата — отпускать нечего
++                        if !keys.is_empty() && self.deferred.remove(&slot).is_none() {
+                             fx.push(Effect::KeyUp(keys.clone()));
+                         }
+                     }
+                 }
+             }
++            Grab::Swipe { start_x } => {
++                self.swipe = Some((x - *start_x).clamp(-self.w, self.w));
++            }
++            Grab::TwoFinger => {
++                let w = self.w;
++                if let Some(t) = &mut self.two {
++                    t.xs.insert(slot, x);
++                    let avg = t.xs.values().sum::<f64>() / t.xs.len() as f64;
++                    self.swipe = Some((avg - t.start).clamp(-w, w));
++                }
++            }
+             Grab::SliderDrag { start_x, start_v, moved } => {
+                 if (x - *start_x).abs() > DRAG_THRESHOLD {
+                     *moved = true;
+@@ -1063,6 +1425,15 @@ impl Model {
+                     }
+                 }
+             }
++            Grab::WSwipe { start_x, done } => {
++                if !*done && (x - *start_x).abs() > 60.0 {
++                    *done = true;
++                    self.weather_days = !self.weather_days;
++                    if let Some(t) = &mut self.weather {
++                        *t = Instant::now();
++                    }
++                }
++            }
+             Grab::Ignore => {}
+         }
+         self.grabs.insert(slot, grab);
+@@ -1075,10 +1446,27 @@ impl Model {
+         if let Some(s) = &mut self.slider {
+             s.last_touch = now;
+         }
++        self.swipe_from.remove(&slot);
++        let deferred = self.deferred.remove(&slot).is_some();
++        self.last_x.remove(&slot);
+         match self.grabs.remove(&slot) {
++            Some(Grab::Swipe { .. }) => fx.extend(self.finish_swipe(now)),
++            // yumi (19.10): поднят любой из двух пальцев — свайп закончен, второй палец дальше ничего не делает.
++            Some(Grab::TwoFinger) => {
++                if let Some(t) = self.two.take() {
++                    for s in t.xs.keys().filter(|s| **s != slot) {
++                        self.grabs.insert(*s, Grab::Ignore);
++                    }
++                }
++                fx.extend(self.finish_swipe(now));
++            }
+             Some(Grab::Press { hit, keys, act, inside, tap }) => {
+                 self.press(hit, false);
+                 if !keys.is_empty() && inside {
++                    // yumi: короткий тап по отложенной клавише — нажать и сразу отпустить
++                    if deferred {
++                        fx.push(Effect::KeyDown(keys.clone()));
++                    }
+                     fx.push(Effect::KeyUp(keys));
+                 }
+                 if inside {
+@@ -1145,6 +1533,7 @@ impl Model {
+                             self.slider = None;
+                             fx.extend(self.close_viz());
+                             self.weather = Some(now);
++                            self.weather_days = false;
+                         }
+                         Some(Action::ToggleFlag(k)) if k == "karaoke" => fx.extend(self.toggle_karaoke(now)),
+                         Some(Action::ToggleFlag(k)) => {
+@@ -1197,13 +1586,19 @@ impl Model {
+     /// Let go of everything, e.g. before the layer under the fingers changes.
+     pub fn release_all(&mut self) -> Vec<Effect> {
+         let mut fx = vec![];
+-        for (_, g) in self.grabs.drain() {
++        for (slot, g) in self.grabs.drain() {
+             if let Grab::Press { keys, inside: true, .. } = g {
+-                if !keys.is_empty() {
++                // yumi: отложенная клавиша ещё не нажата
++                if !keys.is_empty() && !self.deferred.contains_key(&slot) {
+                     fx.push(Effect::KeyUp(keys));
+                 }
+             }
+         }
++        self.deferred.clear();
++        self.swipe_from.clear();
++        self.last_x.clear();
++        self.two = None;
++        self.swipe = None;
+         let now = Instant::now();
+         for v in self.pressed.values_mut() {
+             if v.0 {
+@@ -1213,3 +1608,294 @@ impl Model {
+         fx
+     }
+ }
++
++// yumi (19.10): тесты свайпа между слоями и того, что старые жесты не задеты.
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn model() -> Model {
++        let layout: Layout = serde_json::from_value(serde_json::json!({
++            "layers": {
++                "control": [
++                    {"kind": "button", "w": 200, "act": {"key": ["PlayPause"]}},
++                    {"kind": "button", "w": 200, "act": {"cmd": "echo hi"}},
++                    {"kind": "slider", "w": 120, "target": "volume"},
++                    {"kind": "button", "w": 200, "act": "weather"}
++                ],
++                "work": [{"kind": "button", "w": 200, "act": {"cmd": "work"}}],
++                "tools": [{"kind": "button", "w": 200, "act": {"cmd": "tools"}}],
++                "telegram": [{"kind": "button", "w": 200, "act": {"cmd": "tg"}}]
++            },
++            "default": "control",
++            "fn_layer": null,
++            "settings": {"swipe_layers": ["control", "work", "tools"]}
++        }))
++        .unwrap();
++        Model::new(2008.0, 60.0, Theme::default(), layout)
++    }
++
++    fn mid(m: &Model, n: usize) -> f64 {
++        let (x, w) = m.item_rects()[n];
++        x + w / 2.0
++    }
++
++    fn downs(fx: &[Effect]) -> usize {
++        fx.iter().filter(|e| matches!(e, Effect::KeyDown(_))).count()
++    }
++
++    fn ups(fx: &[Effect]) -> usize {
++        fx.iter().filter(|e| matches!(e, Effect::KeyUp(_))).count()
++    }
++
++    fn ran(fx: &[Effect]) -> bool {
++        fx.iter().any(|e| matches!(e, Effect::Send(Outgoing::Run { .. })))
++    }
++
++    fn sent_layer(fx: &[Effect]) -> Option<String> {
++        fx.iter().find_map(|e| match e {
++            Effect::Send(Outgoing::Layer { name }) => Some(name.clone()),
++            _ => None,
++        })
++    }
++
++    /// Касание в x0, палец до x1, отпустить — все эффекты подряд.
++    fn drag(m: &mut Model, x0: f64, x1: f64) -> Vec<Effect> {
++        let mut fx = m.touch_down(0, x0);
++        let steps = 8;
++        for i in 1..=steps {
++            fx.extend(m.touch_motion(0, x0 + (x1 - x0) * i as f64 / steps as f64));
++        }
++        fx.extend(m.touch_up(0));
++        fx
++    }
++
++    #[test]
++    fn tap_on_buttons_works() {
++        let mut m = model();
++        // Кнопка-клавиша: KeyDown отложен, при коротком тапе — нажать и отпустить.
++        let x = mid(&m, 0);
++        let fx = m.touch_down(0, x);
++        assert_eq!(downs(&fx), 0);
++        let fx = m.touch_up(0);
++        assert_eq!((downs(&fx), ups(&fx)), (1, 1));
++        // Кнопка-команда: срабатывает при отпускании.
++        let x = mid(&m, 1);
++        m.touch_down(0, x);
++        let fx = m.touch_up(0);
++        assert!(ran(&fx));
++        assert_eq!(m.layer, "control");
++    }
++
++    #[test]
++    fn held_key_goes_down_after_defer() {
++        let mut m = model();
++        let x = mid(&m, 0);
++        m.touch_down(0, x);
++        let fx = m.due_keys(Instant::now() + KEY_DEFER);
++        assert_eq!(downs(&fx), 1);
++        let fx = m.touch_up(0);
++        assert_eq!((downs(&fx), ups(&fx)), (0, 1));
++    }
++
++    #[test]
++    fn short_swipe_springs_back_and_presses_nothing() {
++        let mut m = model();
++        for n in [0, 1] {
++            let x = mid(&m, n);
++            let fx = drag(&mut m, x, x - 150.0);
++            assert_eq!((downs(&fx), ups(&fx)), (0, 0), "кнопка {n}");
++            assert!(!ran(&fx), "кнопка {n}");
++            assert_eq!(sent_layer(&fx), None);
++            assert_eq!(m.layer, "control");
++            let a = m.swipe_anim.as_ref().expect("анимация возврата");
++            assert_eq!(a.to, 0.0);
++            assert!(m.swipe.is_none());
++        }
++    }
++
++    #[test]
++    fn long_swipe_walks_the_ring() {
++        let mut m = model();
++        // Влево = следующий.
++        let fx = drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "work");
++        assert_eq!(sent_layer(&fx).as_deref(), Some("work"));
++        drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "tools");
++        // По кругу: после последнего — первый.
++        drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "control");
++        // Вправо = предыдущий, тоже по кругу.
++        drag(&mut m, 200.0, 1000.0);
++        assert_eq!(m.layer, "tools");
++        assert!(m.badge_until.is_some());
++        // Со стартом на кнопке-клавише — ничего не нажато.
++        let mut m = model();
++        let x = mid(&m, 0);
++        let fx = drag(&mut m, x, x - 800.0);
++        assert_eq!(m.layer, "work");
++        assert_eq!((downs(&fx), ups(&fx)), (0, 0));
++    }
++
++    #[test]
++    fn app_layer_takes_home_slot() {
++        let mut m = model();
++        m.agent_layer("telegram");
++        assert_eq!(m.layer, "telegram");
++        assert_eq!(m.swipe_ring(), vec!["telegram", "control", "work", "tools"]);
++        drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "control");
++        drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "work");
++        // Назад: work → control → слой приложения.
++        drag(&mut m, 200.0, 1000.0);
++        assert_eq!(m.layer, "control");
++        drag(&mut m, 200.0, 1000.0);
++        assert_eq!(m.layer, "telegram");
++        // default снимает подмену.
++        m.agent_layer("control");
++        assert!(m.home_override.is_none());
++        assert_eq!(m.swipe_ring(), vec!["control", "work", "tools"]);
++        // Слой из кольца — тоже.
++        m.agent_layer("telegram");
++        m.agent_layer("tools");
++        assert!(m.home_override.is_none());
++    }
++
++    #[test]
++    fn slider_and_weather_swipe_untouched() {
++        let mut m = model();
++        // Ползунок: тянем от кнопки — меняется значение, слой не едет.
++        let x = mid(&m, 2);
++        let mut fx = m.touch_down(0, x);
++        fx.extend(m.touch_motion(0, x + 300.0));
++        assert!(m.swipe.is_none());
++        assert!(fx.iter().any(|e| matches!(e, Effect::Send(Outgoing::Set { .. }))));
++        m.touch_up(0);
++        assert_eq!(m.layer, "control");
++        m.slider = None;
++        // Погода: свайп по прогнозу листает часы/дни.
++        let x = mid(&m, 3);
++        m.touch_down(0, x);
++        m.touch_up(0);
++        assert!(m.weather.is_some());
++        let (_, px, pw) = m.overlay_parts().into_iter().find(|(p, _, _)| *p == Part::WHours).unwrap();
++        drag(&mut m, px + pw / 2.0, px + pw / 2.0 + 200.0);
++        assert!(m.weather_days);
++        assert!(m.swipe.is_none() && m.swipe_anim.is_none());
++        assert_eq!(m.layer, "control");
++    }
++
++    #[test]
++    fn second_finger_ignored_during_swipe() {
++        let mut m = model();
++        m.touch_down(0, 1800.0);
++        m.touch_motion(0, 1600.0);
++        assert!(m.swipe.is_some());
++        let x = mid(&m, 1);
++        m.touch_down(1, x);
++        let fx = m.touch_up(1);
++        assert!(!ran(&fx));
++        m.touch_motion(0, 1000.0);
++        m.touch_up(0);
++        assert_eq!(m.layer, "work");
++    }
++
++    #[test]
++    fn no_ring_means_old_behaviour() {
++        let mut m = model();
++        m.layout.settings.swipe_layers.clear();
++        let x = mid(&m, 0);
++        let fx = m.touch_down(0, x);
++        assert_eq!(downs(&fx), 1, "без кольца клавиша нажимается сразу, как раньше");
++        drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "control");
++    }
++
++    /// Два пальца: оба ставим, ведём вместе на dx, отпускаем первый.
++    fn two_drag(m: &mut Model, a: f64, b: f64, dx: f64) -> Vec<Effect> {
++        let mut fx = m.touch_down(0, a);
++        fx.extend(m.touch_down(1, b));
++        let steps = 8;
++        for i in 1..=steps {
++            let d = dx * i as f64 / steps as f64;
++            fx.extend(m.touch_motion(0, a + d));
++            fx.extend(m.touch_motion(1, b + d));
++        }
++        fx.extend(m.touch_up(0));
++        fx.extend(m.touch_up(1));
++        fx
++    }
++
++    #[test]
++    fn two_finger_swipe_from_key_buttons() {
++        let mut m = model();
++        let (a, b) = (mid(&m, 0), mid(&m, 1));
++        let fx = two_drag(&mut m, a, b, -800.0);
++        assert_eq!(downs(&fx), 0, "клавиша первого пальца не должна нажаться");
++        assert!(!ran(&fx), "команда второй кнопки не должна выполниться");
++        assert_eq!(m.layer, "work");
++        assert_eq!(sent_layer(&fx).as_deref(), Some("work"));
++        // и назад вправо
++        let fx = two_drag(&mut m, 300.0, 500.0, 800.0);
++        assert_eq!(m.layer, "control");
++        assert_eq!(downs(&fx), 0);
++    }
++
++    #[test]
++    fn two_finger_swipe_from_slider_closes_it_and_restores_value() {
++        let mut m = model();
++        let s = mid(&m, 2);
++        let mut fx = m.touch_down(0, s);
++        assert!(m.slider.is_some(), "касание ползунка открывает его");
++        fx.extend(m.touch_motion(0, s + 40.0));         // палец уже чуть подвинул значение
++        fx.extend(m.touch_down(1, s + 300.0));          // второй палец
++        assert!(m.slider.is_none(), "второй палец закрывает ползунок");
++        let restored = fx.iter().rev().find_map(|e| match e {
++            Effect::Send(Outgoing::Set { k, v }) if k == "volume" => Some(*v),
++            _ => None,
++        });
++        assert_eq!(restored, Some(0.0), "значение вернулось к исходному");
++        for i in 1..=8 {
++            let d = -800.0 * i as f64 / 8.0;
++            m.touch_motion(0, s + 40.0 + d);
++            m.touch_motion(1, s + 300.0 + d);
++        }
++        m.touch_up(1);
++        m.touch_up(0);
++        assert_eq!(m.layer, "work");
++    }
++
++    #[test]
++    fn short_two_finger_swipe_springs_back() {
++        let mut m = model();
++        let (a, b) = (mid(&m, 0), mid(&m, 1));
++        let fx = two_drag(&mut m, a, b, -120.0);
++        assert_eq!(m.layer, "control");
++        assert_eq!((downs(&fx), ran(&fx)), (0, false));
++        assert!(m.swipe.is_none() && m.two.is_none());
++    }
++
++    #[test]
++    fn one_finger_tap_still_presses() {
++        let mut m = model();
++        let x = mid(&m, 1);
++        m.touch_down(0, x);
++        let fx = m.touch_up(0);
++        assert!(ran(&fx));
++        assert!(m.two.is_none());
++    }
++
++    /// Случай с полосы (19.10): в фокусе окно со своим слоем, кнопкой «на главный» ушли на control —
++    /// свайп с главного должен работать (раньше слой приложения вытеснял control из кольца).
++    #[test]
++    fn swipe_from_main_while_app_focused() {
++        let mut m = model();
++        m.agent_layer("telegram");
++        m.switch_layer("control");
++        assert!(m.swipe_allowed());
++        drag(&mut m, 1800.0, 1000.0);
++        assert_eq!(m.layer, "work");
++    }
++}
+diff --git a/system/install.sh b/system/install.sh
+index 4b81252..a2b94d3 100755
+--- a/system/install.sh
++++ b/system/install.sh
+@@ -20,6 +20,7 @@ plan=(
+   "$bin|/usr/local/bin/touchbard|755"
+   "$here/agent/touchbar-agent|/usr/local/bin/touchbar-agent|755"
+   "$here/share/touchbar/config.toml|$share/config.toml|644"
++  "$here/share/touchbar/hanko.png|$share/hanko.png|644"   # yumi (19.10): печать для touchid_style = "seal" (ProtectHome закрывает ~)
+   "$here/README.md|$share/README.md|644"
+   "$here/system/touchbard.service|/etc/systemd/system/touchbard.service|644"
+   "$here/system/99-touchbard.rules|/etc/udev/rules.d/99-touchbard.rules|644"
