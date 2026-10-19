@@ -1,0 +1,15 @@
+--- a/agent/touchbar-agent
++++ b/agent/touchbar-agent
+@@ -329,7 +329,11 @@
+         self.unwanted_since = None
+         self.background = bool(meta.get("background"))
+         exe = folder / meta.get("exec", "plugin.py")
+-        self.proc = subprocess.Popen([str(exe)], cwd=folder, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++        cmd = [str(exe)]
++        # a rewritten plugin.py easily loses its exec bit; run a Python plugin through python then
++        if exe.suffix == ".py" and not os.access(exe, os.X_OK):
++            cmd = [sys.executable, str(exe)]
++        self.proc = subprocess.Popen(cmd, cwd=folder, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      start_new_session=True)
+         fd = self.proc.stdout.fileno()
+         os.set_blocking(fd, False)

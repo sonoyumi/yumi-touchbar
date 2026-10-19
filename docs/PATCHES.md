@@ -34,3 +34,9 @@ Both patches apply to [0800tim/touchbard](https://github.com/0800tim/touchbard) 
 | Buttons of the built-in presets call yumi-rice commands instead of Omarchy ones (`apps`, `menu`, `screenshot`, `lock`); Omarchy-only presets (overview, record, night light) are removed. | The bar runs on yumi-rice, not on Omarchy. |
 | Settings passed through: `swipe_*`, `layer_names`, `fps`, `fps_log`, `touchid_style`, `touchid_seal`, `pill_style`. | So the style file can set them. |
 | The Touch ID window is closed by the agent when fprintd stops waiting (also when the lock screen cancels the check). | No prompt left hanging after unlocking with the password. |
+
+## 0003 - plugin start (`agent/touchbar-agent`, Python)
+
+| Change | Why |
+|---|---|
+| A `.py` plugin without the exec bit is started with `python3 plugin.py` instead of failing. | A rewritten `plugin.py` lost its exec bit, the agent got "Permission denied" on every frame and the bar showed an empty grey cell. |

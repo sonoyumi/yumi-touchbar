@@ -86,7 +86,7 @@ PipeWire mute resync. Details: [docs/PATCHES.md](docs/PATCHES.md).
 
 ```
 install.sh / uninstall.sh   # touchbard at a pinned commit + patches, user files, agent
-patches/                    # 0001 daemon (Rust), 0002 agent (Python)
+patches/                    # 0001 daemon (Rust), 0002 agent (Python), 0003 plugin start
 styles/yumi.toml            # the style: 5 swipe layers, Folder, F1-F12, app layers
 plugins/                    # 15 plugins + shared code (cairo); yumi-runcat2 reuses yumi-runcat
 bin/                        # layer switcher, theme from the wallpaper, player volume, Dolphin
